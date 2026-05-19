@@ -1425,15 +1425,12 @@ export class SessionBridge {
     }
     if (!text) return;
     if (!session.threadTs) return;
-    const fromSuffix = args.originatorName
-      ? ` (from ${args.originatorName})`
-      : "";
     let promptTs: string | undefined;
     try {
       const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
-        text: `:hourglass: _queued${fromSuffix}:_ ${formatPromptPreview(text)}`,
+        text: `:hourglass: _queued:_ ${formatPromptPreview(text)}`,
       });
       promptTs = r.ts;
     } catch (err) {
@@ -1504,14 +1501,11 @@ export class SessionBridge {
     const peer = session.peerQueueByMessageId.get(messageId);
     if (peer) {
       peer.text = text;
-      const fromSuffix = peer.originatorName
-        ? ` (from ${peer.originatorName})`
-        : "";
       await this.opts.thread
         .updateMessage(
           session.channel,
           peer.promptTs,
-          `:hourglass: _queued${fromSuffix} (edited):_ ${formatPromptPreview(text)}`,
+          `:hourglass: _queued (edited):_ ${formatPromptPreview(text)}`,
         )
         .catch(() => undefined);
     }
@@ -1585,14 +1579,11 @@ export class SessionBridge {
         .deleteMessage(session.channel, peer.promptTs)
         .catch(() => undefined);
     } else if (reason === "cancelled" || reason === "abandoned") {
-      const fromSuffix = peer.originatorName
-        ? ` from ${peer.originatorName}`
-        : "";
       await this.opts.thread
         .updateMessage(
           session.channel,
           peer.promptTs,
-          `:x: _cancelled (queued${fromSuffix}):_ ${formatPromptPreview(peer.text)}`,
+          `:x: _cancelled (queued):_ ${formatPromptPreview(peer.text)}`,
         )
         .catch(() => undefined);
     }
