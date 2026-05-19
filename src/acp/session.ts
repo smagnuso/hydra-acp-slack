@@ -80,6 +80,23 @@ interface QueuedPromptEntry {
   messageId?: string;
 }
 
+// Tracks a Slack indicator we posted for a PEER-originated queued
+// prompt (one another client like the TUI or browser queued, surfaced
+// in this thread for cross-client visibility). Separate from
+// QueuedPromptEntry because peer prompts don't go through slack's
+// local promptChain / queuedPrompts / waitForIdle machinery — they're
+// pure display state driven entirely by hydra-acp/prompt_queue_*
+// notifications.
+interface PeerQueueIndicator {
+  messageId: string;
+  promptTs: string;
+  text: string;
+  // Name from sentBy / originator.name on the wire ("hydra-acp-tui",
+  // "hydra-acp-browser", etc.). Used to attribute the indicator with
+  // "(from <name>)" so Slack viewers know who queued it.
+  originatorName: string | undefined;
+}
+
 interface ToolCallState {
   toolCallId: string;
   threadMessageTs: string | undefined;
@@ -148,6 +165,12 @@ interface SessionState {
   // FIFO head pending entry. Lets cross-client edits / cancels reach
   // our locally-tracked entry (and its Slack indicator message).
   queueByMessageId: Map<string, QueuedPromptEntry>;
+  // messageId → peer queue indicator. Tracked separately from
+  // queueByMessageId (own entries) so the peer-rendering code paths
+  // can iterate without colliding with the local-chain types. Reused
+  // both for live prompt_queue_added events from peers and for
+  // attach-snapshot hydration on first connection.
+  peerQueueByMessageId: Map<string, PeerQueueIndicator>;
   // Resolvers for any sendUserPrompt awaiting the agent to go idle
   // (spinnerTs becoming undefined). Drained in finalizeSpinnerWork so
   // queued slack-side prompts can fire their session/prompt only when
@@ -356,6 +379,13 @@ export class SessionBridge {
       const sessionId = this.opts.sessionMeta.sessionId;
       void this.ensureSession(sessionId, {})
         .then(async () => {
+          // Hydrate from the attach-response queue snapshot before
+          // replaying buffered prompts. Entries hydra already had
+          // queued for this session (e.g. queued by browser/TUI
+          // before slack attached, or replayed from disk after a
+          // daemon restart) get rendered as peer indicators so the
+          // Slack thread reflects daemon state from the get-go.
+          await this.hydrateQueueFromAttach(sessionId);
           for (const msg of this.opts.initialMessages ?? []) {
             try {
               await this.sendUserPrompt(sessionId, msg.text, msg.images);
@@ -1311,6 +1341,7 @@ export class SessionBridge {
       queuedPromptCount: 0,
       queuedPrompts: [],
       queueByMessageId: new Map(),
+      peerQueueByMessageId: new Map(),
       idleListeners: [],
       userChunks: [],
       title: undefined,
@@ -1371,31 +1402,101 @@ export class SessionBridge {
   }
 
   // hydra-acp/prompt_queue_added: hydra accepted a session/prompt and
-  // pushed it onto its per-session FIFO. If the originator is us, bind
-  // the server's messageId to the FIFO head locally-tracked
-  // QueuedPromptEntry so peer-originated edits/cancels can find it.
-  // Peer-originated added events are no-ops on the Slack side — we
-  // don't render peer queue chips here; that surfaces when the peer's
-  // prompt actually starts (via prompt_received → user_message_chunk).
+  // pushed it onto its per-session FIFO.
+  //
+  // Own-originator: bind the server's messageId to the FIFO head
+  // locally-tracked QueuedPromptEntry so peer-originated edits/cancels
+  // can target it.
+  //
+  // Peer-originator: post a queue indicator to the Slack thread with
+  // "from <name>" attribution so viewers see what's coming up before
+  // it actually starts processing.
   private async handlePromptQueueAdded(
     sessionId: string,
     params: Record<string, unknown>,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    const ownClientId = this.opts.attach.clientId;
-    if (!ownClientId) return;
-    const originator = (params.originator ?? {}) as Record<string, unknown>;
-    if (originator.clientId !== ownClientId) return;
     const messageId =
       typeof params.messageId === "string" ? params.messageId : undefined;
     if (!messageId) return;
-    const unbound = session.queuedPrompts.find(
-      (q) => q.messageId === undefined && !q.cancelled,
-    );
-    if (!unbound) return;
-    unbound.messageId = messageId;
-    session.queueByMessageId.set(messageId, unbound);
+    const ownClientId = this.opts.attach.clientId;
+    const originator = (params.originator ?? {}) as Record<string, unknown>;
+    if (ownClientId && originator.clientId === ownClientId) {
+      const unbound = session.queuedPrompts.find(
+        (q) => q.messageId === undefined && !q.cancelled,
+      );
+      if (!unbound) return;
+      unbound.messageId = messageId;
+      session.queueByMessageId.set(messageId, unbound);
+      return;
+    }
+    await this.postPeerQueueIndicator(session, {
+      messageId,
+      prompt: params.prompt,
+      originatorName:
+        typeof originator.name === "string" ? originator.name : undefined,
+    });
+  }
+
+  // Shared post-and-track for peer-originated queue indicators. Used
+  // by both the live prompt_queue_added handler and by the attach-time
+  // queue snapshot hydration. Idempotent on messageId so the snapshot
+  // path doesn't double-post if a live event already raced ahead.
+  private async postPeerQueueIndicator(
+    session: SessionState,
+    args: {
+      messageId: string;
+      prompt: unknown;
+      originatorName: string | undefined;
+    },
+  ): Promise<void> {
+    if (session.peerQueueByMessageId.has(args.messageId)) {
+      return;
+    }
+    const blocks = Array.isArray(args.prompt) ? args.prompt : [];
+    let text = "";
+    for (const block of blocks) {
+      if (block && typeof block === "object") {
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") {
+          text += b.text;
+        }
+      }
+    }
+    if (!text) return;
+    if (!session.threadTs) return;
+    const fromSuffix = args.originatorName
+      ? ` (from ${args.originatorName})`
+      : "";
+    let promptTs: string | undefined;
+    try {
+      const r = await this.opts.thread.postMessage({
+        channel: session.channel,
+        threadTs: session.threadTs,
+        text: `:hourglass: _queued${fromSuffix}:_ ${formatPromptPreview(text)}`,
+      });
+      promptTs = r.ts;
+    } catch (err) {
+      log.warn(`peer queue indicator post failed: ${(err as Error).message}`);
+      return;
+    }
+    if (!promptTs) return;
+    // Re-check map after the await — another path (live event arriving
+    // during the snapshot post) might have populated it; if so, delete
+    // the duplicate Slack message we just posted.
+    if (session.peerQueueByMessageId.has(args.messageId)) {
+      await this.opts.thread
+        .deleteMessage(session.channel, promptTs)
+        .catch(() => undefined);
+      return;
+    }
+    session.peerQueueByMessageId.set(args.messageId, {
+      messageId: args.messageId,
+      promptTs,
+      text,
+      originatorName: args.originatorName,
+    });
   }
 
   // hydra-acp/prompt_queue_updated: another client (or us) called
@@ -1413,8 +1514,6 @@ export class SessionBridge {
     const messageId =
       typeof params.messageId === "string" ? params.messageId : undefined;
     if (!messageId) return;
-    const entry = session.queueByMessageId.get(messageId);
-    if (!entry) return;
     const blocks = Array.isArray(params.prompt) ? params.prompt : [];
     let text = "";
     for (const block of blocks) {
@@ -1426,13 +1525,34 @@ export class SessionBridge {
       }
     }
     if (!text) return;
-    entry.text = text;
-    if (entry.promptTs) {
+    // Try own entries first (the originator's queue indicator), then
+    // peer indicators (cross-client edits to a prompt we're showing
+    // for visibility). Either way, refresh the Slack indicator text.
+    const ownEntry = session.queueByMessageId.get(messageId);
+    if (ownEntry) {
+      ownEntry.text = text;
+      if (ownEntry.promptTs) {
+        await this.opts.thread
+          .updateMessage(
+            session.channel,
+            ownEntry.promptTs,
+            `:hourglass: _queued (edited):_ ${formatPromptPreview(text)}`,
+          )
+          .catch(() => undefined);
+      }
+      return;
+    }
+    const peer = session.peerQueueByMessageId.get(messageId);
+    if (peer) {
+      peer.text = text;
+      const fromSuffix = peer.originatorName
+        ? ` (from ${peer.originatorName})`
+        : "";
       await this.opts.thread
         .updateMessage(
           session.channel,
-          entry.promptTs,
-          `:hourglass: _queued (edited):_ ${formatPromptPreview(text)}`,
+          peer.promptTs,
+          `:hourglass: _queued${fromSuffix} (edited):_ ${formatPromptPreview(text)}`,
         )
         .catch(() => undefined);
     }
@@ -1454,36 +1574,100 @@ export class SessionBridge {
     const messageId =
       typeof params.messageId === "string" ? params.messageId : undefined;
     if (!messageId) return;
-    const entry = session.queueByMessageId.get(messageId);
-    if (!entry) return;
     const reason = typeof params.reason === "string" ? params.reason : "";
-    if (reason === "cancelled" || reason === "abandoned") {
-      // The local chain hasn't yet fired its cancellation code path
-      // (this notification IS hydra telling us). Mark cancelled and
-      // splice from the per-session queuedPromptCount so subsequent
-      // prompts get the right "ahead" count.
-      if (!entry.cancelled) {
-        entry.cancelled = true;
-        session.queuedPromptCount = Math.max(
-          0,
-          session.queuedPromptCount - 1,
-        );
+    const ownEntry = session.queueByMessageId.get(messageId);
+    if (ownEntry) {
+      if (reason === "cancelled" || reason === "abandoned") {
+        // The local chain hasn't yet fired its cancellation code path
+        // (this notification IS hydra telling us). Mark cancelled and
+        // splice from the per-session queuedPromptCount so subsequent
+        // prompts get the right "ahead" count.
+        if (!ownEntry.cancelled) {
+          ownEntry.cancelled = true;
+          session.queuedPromptCount = Math.max(
+            0,
+            session.queuedPromptCount - 1,
+          );
+        }
+        session.queueByMessageId.delete(messageId);
+        if (ownEntry.promptTs) {
+          await this.opts.thread
+            .updateMessage(
+              session.channel,
+              ownEntry.promptTs,
+              `:x: _cancelled (queued):_ ${formatPromptPreview(ownEntry.text)}`,
+            )
+            .catch(() => undefined);
+        }
+      } else if (reason === "started") {
+        // The local chain handles the transition to "processing" for
+        // own prompts. Just drop the messageId binding — the chain
+        // owns the entry's lifecycle from here.
+        session.queueByMessageId.delete(messageId);
       }
-      session.queueByMessageId.delete(messageId);
-      if (entry.promptTs) {
-        await this.opts.thread
-          .updateMessage(
-            session.channel,
-            entry.promptTs,
-            `:x: _cancelled (queued):_ ${formatPromptPreview(entry.text)}`,
-          )
-          .catch(() => undefined);
-      }
-    } else if (reason === "started") {
-      // The local chain handles the transition to "processing" for own
-      // prompts. Just drop the messageId binding — the chain owns the
-      // entry's lifecycle from here.
-      session.queueByMessageId.delete(messageId);
+      return;
+    }
+    const peer = session.peerQueueByMessageId.get(messageId);
+    if (!peer) return;
+    session.peerQueueByMessageId.delete(messageId);
+    if (reason === "started") {
+      // Peer's prompt is now running. The existing prompt_received
+      // handler will post the actual user message into the thread
+      // moments later, so delete our queue indicator to avoid
+      // showing both. (Race window between delete + the new post is
+      // brief and visually fine — Slack just replaces one message
+      // with another.)
+      await this.opts.thread
+        .deleteMessage(session.channel, peer.promptTs)
+        .catch(() => undefined);
+    } else if (reason === "cancelled" || reason === "abandoned") {
+      const fromSuffix = peer.originatorName
+        ? ` from ${peer.originatorName}`
+        : "";
+      await this.opts.thread
+        .updateMessage(
+          session.channel,
+          peer.promptTs,
+          `:x: _cancelled (queued${fromSuffix}):_ ${formatPromptPreview(peer.text)}`,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  // Walk the queue snapshot the daemon delivered on session/attach
+  // (_meta["hydra-acp"].queue) and post peer indicators for entries
+  // that aren't ours. Skips position 0 — that prompt's user-text
+  // landed (or will land) in scrollback via prompt_received during
+  // history replay, so an extra queue indicator would just be noise.
+  private async hydrateQueueFromAttach(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const meta = this.opts.attach.attachMeta;
+    if (!meta) return;
+    const hydra = meta["hydra-acp"];
+    if (!hydra || typeof hydra !== "object" || Array.isArray(hydra)) return;
+    const queue = (hydra as Record<string, unknown>).queue;
+    if (!Array.isArray(queue)) return;
+    const ownClientId = this.opts.attach.clientId;
+    for (const raw of queue) {
+      if (!raw || typeof raw !== "object") continue;
+      const e = raw as Record<string, unknown>;
+      const messageId =
+        typeof e.messageId === "string" ? e.messageId : undefined;
+      if (!messageId) continue;
+      const position = typeof e.position === "number" ? e.position : 0;
+      if (position === 0) continue;
+      const originator = (e.originator ?? {}) as Record<string, unknown>;
+      // If somehow it's our own entry (shouldn't happen on a fresh
+      // attach — our prior clientId is gone), skip; the local-chain
+      // path doesn't have local state to bind it to.
+      if (ownClientId && originator.clientId === ownClientId) continue;
+      await this.postPeerQueueIndicator(session, {
+        messageId,
+        prompt: e.prompt,
+        originatorName:
+          typeof originator.name === "string" ? originator.name : undefined,
+      });
     }
   }
 
@@ -2108,6 +2292,24 @@ export class SessionBridge {
             )
             .catch(() => undefined);
           return;
+        }
+        // Not one of our own queued entries — maybe it's a peer's
+        // indicator we posted via prompt_queue_added. Find it by ts
+        // and fire hydra-acp/cancel_prompt to drop it from hydra's
+        // queue. The daemon's prompt_queue_removed{cancelled} echo
+        // updates everyone (including this thread) to the cancelled
+        // state.
+        for (const [, peer] of session.peerQueueByMessageId) {
+          if (peer.promptTs === ts) {
+            log.info(
+              `peer queue-cancel <- slack ${sessionId.slice(0, 8)}: ${peer.text.slice(0, 80)}`,
+            );
+            this.opts.attach.notify("hydra-acp/cancel_prompt", {
+              sessionId,
+              messageId: peer.messageId,
+            });
+            return;
+          }
         }
         // Spinner cancel: send session/cancel for the running turn.
         // The agent's response (stopReason "cancelled") flows through
