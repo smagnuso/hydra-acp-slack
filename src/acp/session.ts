@@ -2189,18 +2189,28 @@ export class SessionBridge {
           log.info(
             `queue-cancel <- slack ${sessionId.slice(0, 8)}: ${queued.text.slice(0, 80)}`,
           );
-          // If the entry has been bound to a server messageId
-          // (prompt_queue_added arrived already), use hydra-acp/
-          // cancel_prompt so peers see the prompt_queue_removed
-          // broadcast and tear down their own indicators. Otherwise
-          // the local chain catches the cancelled flag at the next
-          // tick and skips sending to hydra entirely — nothing to
-          // cancel server-side.
+          // Drop the entry from hydra's queue. cancel_prompt is a
+          // request per the wire spec (the daemon's onRequest handler
+          // returns { cancelled, reason }), so it must be sent via
+          // attach.request — using notify here would be a no-op and
+          // the entry would keep running. We don't need the response;
+          // the daemon's prompt_queue_removed{cancelled} broadcast is
+          // what tells every attached client (including us) to tear
+          // down their indicators.
+          //
+          // queued.messageId is set as soon as prompt_queue_added
+          // binds, which lands within milliseconds of sendUserPrompt
+          // firing session/prompt. If the user reacts faster than the
+          // round-trip — vanishingly rare — we have nothing to target
+          // server-side; the optimistic local mark prevents UI
+          // weirdness, and the in-flight session/prompt will just run.
           if (queued.messageId) {
-            this.opts.attach.notify("hydra-acp/cancel_prompt", {
-              sessionId,
-              messageId: queued.messageId,
-            });
+            void this.opts.attach
+              .request("hydra-acp/cancel_prompt", {
+                sessionId,
+                messageId: queued.messageId,
+              })
+              .catch(() => undefined);
             session.queueByMessageId.delete(queued.messageId);
           }
           await this.opts.thread
@@ -2223,10 +2233,12 @@ export class SessionBridge {
             log.info(
               `peer queue-cancel <- slack ${sessionId.slice(0, 8)}: ${peer.text.slice(0, 80)}`,
             );
-            this.opts.attach.notify("hydra-acp/cancel_prompt", {
-              sessionId,
-              messageId: peer.messageId,
-            });
+            void this.opts.attach
+              .request("hydra-acp/cancel_prompt", {
+                sessionId,
+                messageId: peer.messageId,
+              })
+              .catch(() => undefined);
             return;
           }
         }
