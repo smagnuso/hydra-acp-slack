@@ -83,10 +83,9 @@ interface QueuedPromptEntry {
 // Tracks a Slack indicator we posted for a PEER-originated queued
 // prompt (one another client like the TUI or browser queued, surfaced
 // in this thread for cross-client visibility). Separate from
-// QueuedPromptEntry because peer prompts don't go through slack's
-// local promptChain / queuedPrompts / waitForIdle machinery — they're
-// pure display state driven entirely by hydra-acp/prompt_queue_*
-// notifications.
+// QueuedPromptEntry because peer prompts have no in-flight session/
+// prompt request on this side — they're pure display state driven
+// entirely by hydra-acp/prompt_queue_* notifications.
 interface PeerQueueIndicator {
   messageId: string;
   promptTs: string;
@@ -136,34 +135,18 @@ interface SessionState {
   // for one agent burst. Each flush queues onto this chain so the
   // post-and-set-ts step is effectively atomic.
   agentFlushChain: Promise<void> | undefined;
-  // Per-session inbound-prompt serializer. Bolt runs app.message handlers
-  // in parallel; without this, three Slack messages typed in quick
-  // succession produce three concurrent session/prompt requests, hydra
-  // fans user_message_chunks for all of them back-to-back, and sibling
-  // frontends merge them into a single rendered prompt because no agent
-  // activity falls between them. Queueing forces turn-by-turn flow: each
-  // prompt awaits the previous one's response (and our own-turn-end
-  // close) before sending.
-  promptChain: Promise<void> | undefined;
-  // Number of Slack-originated prompts currently in flight on this
-  // session (queued or running). Incremented at enqueue, decremented
-  // when the corresponding sendUserPromptWork resolves. Used to drive
-  // the queued / processing indicator: if non-zero when a new prompt
-  // arrives, the new prompt is going to wait behind something and
-  // gets a visible queue marker.
-  queuedPromptCount: number;
-  // Per-prompt entries for any prompt that posted a queue indicator
-  // (i.e. wasn't first-of-batch). Lets the cancel reaction match a
-  // user's :stop_sign: on a queued indicator to the specific prompt
-  // and splice it out of the queue before its work runs. Each entry
-  // is removed in the chain's finally regardless of how the prompt
-  // resolved (run, cancelled, errored).
+  // Per-prompt entries for own (slack-originated) queued prompts.
+  // Pushed when sendUserPrompt fires session/prompt to hydra; bound
+  // to a server messageId when prompt_queue_added with our originator
+  // arrives; removed when the corresponding session/prompt response
+  // resolves. Carries the Slack indicator's ts so :stop_sign:
+  // reactions can target the right entry.
   queuedPrompts: QueuedPromptEntry[];
   // messageId → queued entry for hydra-acp/prompt_queue_updated and
   // prompt_queue_removed notifications. Populated when a
-  // prompt_queue_added with our originator arrives and binds to the
-  // FIFO head pending entry. Lets cross-client edits / cancels reach
-  // our locally-tracked entry (and its Slack indicator message).
+  // prompt_queue_added with our originator binds to a FIFO-head
+  // unbound entry in queuedPrompts. Lets cross-client edits / cancels
+  // reach our locally-tracked entry (and its Slack indicator message).
   queueByMessageId: Map<string, QueuedPromptEntry>;
   // messageId → peer queue indicator. Tracked separately from
   // queueByMessageId (own entries) so the peer-rendering code paths
@@ -171,14 +154,6 @@ interface SessionState {
   // both for live prompt_queue_added events from peers and for
   // attach-snapshot hydration on first connection.
   peerQueueByMessageId: Map<string, PeerQueueIndicator>;
-  // Resolvers for any sendUserPrompt awaiting the agent to go idle
-  // (spinnerTs becoming undefined). Drained in finalizeSpinnerWork so
-  // queued slack-side prompts can fire their session/prompt only when
-  // the agent's prior turn has actually completed — keeps prompts out
-  // of hydra's per-session FIFO until they're truly our turn, so
-  // :stop_sign: on the queue indicator can splice them out before any
-  // wire frame goes upstream.
-  idleListeners: Array<() => void>;
   // Streaming user message from another frontend attached to the same
   // session (e.g. the editor's stdio shim). Same flush model as agent.
   userChunks: string[];
@@ -1114,7 +1089,7 @@ export class SessionBridge {
 
   // Transform the per-turn spinner into a quiet, static "turn ran"
   // marker. Called at turn end from both the turn_complete arm
-  // (sibling-driven turns) and the sendUserPromptWork tail (own turns).
+  // (sibling-driven turns) and the sendUserPrompt tail (own turns).
   //
   // We deliberately do NOT chat.delete the message — keeping a one-line
   // marker between turns gives the thread visible structure. If the
@@ -1129,12 +1104,6 @@ export class SessionBridge {
   cleanup(): void {
     for (const session of this.sessions.values()) {
       this.stopSpinnerTicker(session);
-      // Wake any sendUserPrompt waiters so their chains can resolve
-      // (cancelled or sent) instead of hanging the bridge process.
-      const listeners = session.idleListeners.splice(0);
-      for (const resolve of listeners) {
-        resolve();
-      }
     }
   }
 
@@ -1219,13 +1188,6 @@ export class SessionBridge {
     session.turnToolCallIds = [];
     session.spinnerStartedAt = undefined;
     session.planTs = undefined;
-    // Wake any sendUserPrompt awaiting a turn boundary. Drained here
-    // so the next slack-side prompt can fire its session/prompt
-    // exactly when the agent goes idle, not before.
-    const listeners = session.idleListeners.splice(0);
-    for (const resolve of listeners) {
-      resolve();
-    }
     // Delete the in-progress spinner (where it originally posted, mid-turn)
     // and post a fresh "Ready" marker at the bottom of the thread. One
     // turn-boundary message instead of two — and the bottom marker is the
@@ -1337,12 +1299,9 @@ export class SessionBridge {
       agentLastSent: undefined,
       agentRenderedBase: 0,
       agentFlushChain: undefined,
-      promptChain: undefined,
-      queuedPromptCount: 0,
       queuedPrompts: [],
       queueByMessageId: new Map(),
       peerQueueByMessageId: new Map(),
-      idleListeners: [],
       userChunks: [],
       title: undefined,
       cwd,
@@ -1578,17 +1537,12 @@ export class SessionBridge {
     const ownEntry = session.queueByMessageId.get(messageId);
     if (ownEntry) {
       if (reason === "cancelled" || reason === "abandoned") {
-        // The local chain hasn't yet fired its cancellation code path
-        // (this notification IS hydra telling us). Mark cancelled and
-        // splice from the per-session queuedPromptCount so subsequent
-        // prompts get the right "ahead" count.
-        if (!ownEntry.cancelled) {
-          ownEntry.cancelled = true;
-          session.queuedPromptCount = Math.max(
-            0,
-            session.queuedPromptCount - 1,
-          );
-        }
+        // The session/prompt awaiter in sendUserPrompt is still alive
+        // here — it'll resolve shortly with stopReason:"cancelled" and
+        // remove the entry from queuedPrompts in its finally block.
+        // Mark cancelled defensively so :stop_sign:'s own-queue check
+        // skips this entry.
+        ownEntry.cancelled = true;
         session.queueByMessageId.delete(messageId);
         if (ownEntry.promptTs) {
           await this.opts.thread
@@ -1600,9 +1554,19 @@ export class SessionBridge {
             .catch(() => undefined);
         }
       } else if (reason === "started") {
-        // The local chain handles the transition to "processing" for
-        // own prompts. Just drop the messageId binding — the chain
-        // owns the entry's lifecycle from here.
+        // The local chain used to call markQueueIndicatorProcessing
+        // when its turn came up; now that the daemon owns
+        // serialization, drive that transition off the queue event.
+        // Only fires if a queued indicator was actually posted (i.e.
+        // the prompt waited for at least one other turn).
+        ownEntry.started = true;
+        if (ownEntry.promptTs) {
+          void this.markQueueIndicatorProcessing(
+            session,
+            ownEntry.promptTs,
+            ownEntry.text,
+          ).catch(() => undefined);
+        }
         session.queueByMessageId.delete(messageId);
       }
       return;
@@ -1980,106 +1944,124 @@ export class SessionBridge {
       log.warn(`sendUserPrompt for unknown session ${sessionId}`);
       return;
     }
-    // wasQueued covers both "another Slack prompt is ahead of us" and
-    // "the agent is currently mid-turn on something else (e.g. a prompt
-    // from another attached frontend)". For the latter, agents generally
-    // serialize per-session, so our session/prompt will wait for the
-    // in-flight turn to finish. An active spinner is a reliable proxy
-    // for "agent is busy on this session."
-    const wasQueued =
-      session.queuedPromptCount > 0 || session.spinnerTs !== undefined;
-    // Number of in-flight turns the agent has to finish before getting
-    // to us. queuedPromptCount counts Slack-originated prompts; if it
-    // is 0 but a spinner is up, that's a turn from another frontend
-    // we're queueing behind, so count it as 1.
+    // Estimate "ahead of us" optimistically from local state for the
+    // initial queued indicator. Hydra's authoritative count arrives via
+    // prompt_queue_added shortly after, but we want feedback in the
+    // thread the moment the user hits send. Counts both own entries
+    // we've already submitted (still in queuedPrompts) and peer
+    // entries we know about; falls back to "1 ahead" if the agent's
+    // spinner is up but we don't have queue knowledge (peer turn
+    // started before we attached, or running from a non-queue-aware
+    // path).
+    const ownAhead = session.queuedPrompts.length;
+    const peerAhead = session.peerQueueByMessageId.size;
     const aheadCount =
-      session.queuedPromptCount > 0
-        ? session.queuedPromptCount
+      ownAhead + peerAhead > 0
+        ? ownAhead + peerAhead
         : session.spinnerTs
-        ? 1
-        : 0;
-    session.queuedPromptCount += 1;
+          ? 1
+          : 0;
+    // Whether to post a queued indicator at all. If nothing's ahead of
+    // us we skip the queued → processing dance and let the spinner
+    // appear when the agent starts emitting. Matches the original
+    // wasQueued check.
+    const willWait = aheadCount > 0;
 
-    // If this prompt is going to wait, register a queued entry the
-    // cancel reaction can target by ts, and drop a queue indicator
-    // into the thread. The post is fire-and-forget; we stash the ts
-    // back onto the entry once known so :stop_sign: on the indicator
-    // can splice this prompt out before it runs.
-    const queuedEntry: QueuedPromptEntry | undefined = wasQueued
-      ? { text, promptTs: undefined, cancelled: false, started: false }
-      : undefined;
-    if (queuedEntry) {
-      session.queuedPrompts.push(queuedEntry);
-    }
+    // Track this entry locally for the lifetime of the round-trip.
+    // promptTs gets stashed when the queued indicator post resolves.
+    // messageId gets bound when hydra-acp/prompt_queue_added arrives.
+    // started flips true when prompt_queue_removed{started} fires —
+    // used by :stop_sign: handler to know whether the cancel still has
+    // a queue slot to drop or needs a session/cancel.
+    const queuedEntry: QueuedPromptEntry = {
+      text,
+      promptTs: undefined,
+      cancelled: false,
+      started: false,
+    };
+    session.queuedPrompts.push(queuedEntry);
 
-    const queueTsPromise: Promise<string | undefined> = queuedEntry
-      ? this.postQueueIndicator(session, text, aheadCount).then((ts) => {
-          if (queuedEntry && ts) {
+    // Post the queued indicator (fire-and-forget; the ts lands on
+    // queuedEntry when the API call resolves). Skipped when nothing's
+    // ahead so an immediate-turn prompt doesn't flicker queued before
+    // processing.
+    if (willWait) {
+      void this.postQueueIndicator(session, text, aheadCount)
+        .then((ts) => {
+          if (ts && !queuedEntry.cancelled) {
             queuedEntry.promptTs = ts;
           }
-          return ts;
         })
-      : Promise.resolve(undefined);
-
-    const previous = session.promptChain ?? Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(async () => {
-        try {
-          if (queuedEntry?.cancelled) {
-            // Cancelled while waiting in our chain. Indicator already
-            // updated by the cancel handler; nothing to send upstream.
-            return;
-          }
-          // Hold here until the agent's prior turn finishes (spinner
-          // gone). This keeps our prompt out of hydra's per-session
-          // FIFO so :stop_sign: on the queue indicator can splice it
-          // out without sending a session/cancel.
-          await this.waitForIdle(session);
-          if (queuedEntry?.cancelled) {
-            return;
-          }
-          if (queuedEntry) {
-            queuedEntry.started = true;
-            const ts = await queueTsPromise;
-            if (ts) {
-              await this.markQueueIndicatorProcessing(
-                session,
-                ts,
-                text,
-              ).catch(() => undefined);
-            }
-          }
-          await this.sendUserPromptWork(session, text, images);
-        } finally {
-          if (!queuedEntry?.cancelled) {
-            session.queuedPromptCount = Math.max(
-              0,
-              session.queuedPromptCount - 1,
-            );
-          }
-          if (queuedEntry) {
-            const idx = session.queuedPrompts.indexOf(queuedEntry);
-            if (idx >= 0) {
-              session.queuedPrompts.splice(idx, 1);
-            }
-          }
-        }
-      });
-    session.promptChain = next;
-    return next;
-  }
-
-  // Resolves when the agent has no spinner up (i.e. is between turns).
-  // Resolves immediately if already idle. Otherwise queues a callback
-  // that finalizeSpinnerWork drains when it clears spinnerTs.
-  private async waitForIdle(session: SessionState): Promise<void> {
-    if (!session.spinnerTs) {
-      return;
+        .catch(() => undefined);
     }
-    return new Promise<void>((resolve) => {
-      session.idleListeners.push(resolve);
+
+    // Suppress own-prompt echo from the user_message_chunk hydra will
+    // re-broadcast back to us. Same intent as before — the slack
+    // thread already shows the user's typed message natively, no need
+    // to re-render it.
+    if (text) {
+      this.rememberOwnPrompt(sessionId, text);
+    }
+
+    log.info(
+      `prompt -> ${sessionId.slice(0, 8)}: ${text.slice(0, 80)}${images.length > 0 ? ` [+${images.length} image(s)]` : ""}`,
+    );
+
+    // Build the prompt content blocks and fire session/prompt EAGERLY.
+    // The daemon-side queue (hydra-acp's prompt_queue_*) is now the
+    // authoritative serializer — every attached client (TUI, browser,
+    // peers) sees this prompt's queue position via prompt_queue_added
+    // as soon as hydra accepts it, instead of after slack's local
+    // chain drained.
+    const prompt: Array<Record<string, unknown>> = [];
+    if (text) {
+      prompt.push({ type: "text", text });
+    }
+    for (const img of images) {
+      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
+    }
+
+    let stopReason: string | undefined;
+    try {
+      const response = await this.opts.attach.request<{
+        stopReason?: string;
+      }>("session/prompt", {
+        sessionId,
+        prompt,
+      });
+      stopReason = response?.stopReason;
+    } catch (err) {
+      log.warn(
+        `prompt request failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+      );
+    } finally {
+      // Drop the local entry. queueByMessageId was already cleared by
+      // the prompt_queue_removed handler that fired when this turn
+      // started.
+      const idx = session.queuedPrompts.indexOf(queuedEntry);
+      if (idx >= 0) {
+        session.queuedPrompts.splice(idx, 1);
+      }
+    }
+
+    // When we are the originator, hydra excludes us from the
+    // synthesized turn_complete broadcast. The session/prompt response
+    // is the turn-end signal for this side. Run the cleanup tail on
+    // notificationChain so any subsequent session/update events for
+    // the *next* turn (which hydra dequeues immediately after our
+    // response) wait behind our finalizeSpinner — without this, the
+    // next turn's first agent_message_chunk hits ensureSpinner with
+    // spinnerTs still set to our spinner and silently no-ops.
+    log.info(
+      `own-turn end ${sessionId.slice(0, 8)}${stopReason ? ` (${stopReason})` : ""}`,
+    );
+    const tail = this.notificationChain.then(async () => {
+      await this.flushAgentMessage(session);
+      this.closeAgentMessage(session);
+      await this.finalizeSpinner(session, stopReason);
     });
+    this.notificationChain = tail.catch(() => undefined);
+    await tail;
   }
 
   // Slack-side feedback for a Slack-originated prompt that has to wait
@@ -2130,11 +2112,11 @@ export class SessionBridge {
     if (!session.threadTs) {
       return;
     }
-    // Number of prompts still queued behind us. queuedPromptCount
-    // includes our own entry until our finally decrements it, so
-    // subtract 1 here. Hidden parenthetical when the queue is empty
-    // behind us — keeps the common case clean.
-    const waiting = Math.max(0, session.queuedPromptCount - 1);
+    // Number of own prompts still queued behind this one. queuedPrompts
+    // includes the currently-running entry (us) until our finally
+    // removes it, so subtract 1. Hidden parenthetical when nothing's
+    // queued behind us — keeps the common case clean.
+    const waiting = Math.max(0, session.queuedPrompts.length - 1);
     const suffix =
       waiting > 0
         ? ` · ${waiting === 1 ? "1 waiting" : `${waiting} waiting`}`
@@ -2150,52 +2132,6 @@ export class SessionBridge {
           `processing indicator post failed: ${(err as Error).message}`,
         );
       });
-  }
-
-  private async sendUserPromptWork(
-    session: SessionState,
-    text: string,
-    images: ReadonlyArray<{ type: "image"; mimeType: string; data: string }>,
-  ): Promise<void> {
-    const sessionId = session.sessionId;
-    log.info(
-      `prompt -> ${sessionId.slice(0, 8)}: ${text.slice(0, 80)}${images.length > 0 ? ` [+${images.length} image(s)]` : ""}`,
-    );
-    if (text) {
-      this.rememberOwnPrompt(sessionId, text);
-    }
-    const prompt: Array<Record<string, unknown>> = [];
-    if (text) {
-      prompt.push({ type: "text", text });
-    }
-    for (const img of images) {
-      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
-    }
-    const response = await this.opts.attach.request<{
-      stopReason?: string;
-    }>("session/prompt", {
-      sessionId,
-      prompt,
-    });
-    // When we are the originator, hydra excludes us from the
-    // synthesized turn_complete broadcast. The session/prompt response
-    // is the turn-end signal for this side. Run the cleanup tail on
-    // notificationChain so any subsequent session/update events for
-    // the *next* turn (which hydra dequeues immediately after our
-    // response) wait behind our finalizeSpinner — without this, the
-    // next turn's first agent_message_chunk hits ensureSpinner with
-    // spinnerTs still set to our spinner and silently no-ops.
-    const stopReason = response?.stopReason;
-    log.info(
-      `own-turn end ${sessionId.slice(0, 8)}${stopReason ? ` (${stopReason})` : ""}`,
-    );
-    const tail = this.notificationChain.then(async () => {
-      await this.flushAgentMessage(session);
-      this.closeAgentMessage(session);
-      await this.finalizeSpinner(session, stopReason);
-    });
-    this.notificationChain = tail.catch(() => undefined);
-    await tail;
   }
 
   // Permission reaction → session/request_permission response. Takes
@@ -2259,14 +2195,6 @@ export class SessionBridge {
         );
         if (queued) {
           queued.cancelled = true;
-          // Drop the count immediately so subsequent prompts compute
-          // an accurate "ahead" depth. The chain's finally checks the
-          // cancelled flag and skips its own decrement to avoid
-          // double-counting.
-          session.queuedPromptCount = Math.max(
-            0,
-            session.queuedPromptCount - 1,
-          );
           log.info(
             `queue-cancel <- slack ${sessionId.slice(0, 8)}: ${queued.text.slice(0, 80)}`,
           );
