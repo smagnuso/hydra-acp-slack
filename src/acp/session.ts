@@ -71,6 +71,13 @@ interface QueuedPromptEntry {
   promptTs: string | undefined;
   cancelled: boolean;
   started: boolean;
+  // Server-assigned id from hydra-acp/prompt_queue_added. Undefined
+  // between the local enqueue and the daemon's accept; once bound,
+  // used as the target for hydra-acp/cancel_prompt (instead of local
+  // chain splicing) so peers see the cancellation too, and as the key
+  // for prompt_queue_updated to refresh the Slack indicator text when
+  // another client edits this queued prompt.
+  messageId?: string;
 }
 
 interface ToolCallState {
@@ -135,6 +142,12 @@ interface SessionState {
   // is removed in the chain's finally regardless of how the prompt
   // resolved (run, cancelled, errored).
   queuedPrompts: QueuedPromptEntry[];
+  // messageId → queued entry for hydra-acp/prompt_queue_updated and
+  // prompt_queue_removed notifications. Populated when a
+  // prompt_queue_added with our originator arrives and binds to the
+  // FIFO head pending entry. Lets cross-client edits / cancels reach
+  // our locally-tracked entry (and its Slack indicator message).
+  queueByMessageId: Map<string, QueuedPromptEntry>;
   // Resolvers for any sendUserPrompt awaiting the agent to go idle
   // (spinnerTs becoming undefined). Drained in finalizeSpinnerWork so
   // queued slack-side prompts can fire their session/prompt only when
@@ -461,6 +474,25 @@ export class SessionBridge {
 
     if (n.method === "session/update" && sessionId) {
       await this.handleSessionUpdate(sessionId, params);
+      return;
+    }
+
+    // Server-driven queue notifications. Hydra emits these for any
+    // session/prompt arrival; we use them to bind a server messageId
+    // to a locally-tracked QueuedPromptEntry (so reactions on our
+    // queue indicator can fire hydra-acp/cancel_prompt for cross-
+    // client cancellation), and to mirror cross-client edits /
+    // cancels back into the Slack indicator.
+    if (n.method === "hydra-acp/prompt_queue_added" && sessionId) {
+      await this.handlePromptQueueAdded(sessionId, params);
+      return;
+    }
+    if (n.method === "hydra-acp/prompt_queue_updated" && sessionId) {
+      await this.handlePromptQueueUpdated(sessionId, params);
+      return;
+    }
+    if (n.method === "hydra-acp/prompt_queue_removed" && sessionId) {
+      await this.handlePromptQueueRemoved(sessionId, params);
       return;
     }
 
@@ -1278,6 +1310,7 @@ export class SessionBridge {
       promptChain: undefined,
       queuedPromptCount: 0,
       queuedPrompts: [],
+      queueByMessageId: new Map(),
       idleListeners: [],
       userChunks: [],
       title: undefined,
@@ -1335,6 +1368,123 @@ export class SessionBridge {
       }
     }
     return this.opts.config.slackChannelId ?? undefined;
+  }
+
+  // hydra-acp/prompt_queue_added: hydra accepted a session/prompt and
+  // pushed it onto its per-session FIFO. If the originator is us, bind
+  // the server's messageId to the FIFO head locally-tracked
+  // QueuedPromptEntry so peer-originated edits/cancels can find it.
+  // Peer-originated added events are no-ops on the Slack side — we
+  // don't render peer queue chips here; that surfaces when the peer's
+  // prompt actually starts (via prompt_received → user_message_chunk).
+  private async handlePromptQueueAdded(
+    sessionId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const ownClientId = this.opts.attach.clientId;
+    if (!ownClientId) return;
+    const originator = (params.originator ?? {}) as Record<string, unknown>;
+    if (originator.clientId !== ownClientId) return;
+    const messageId =
+      typeof params.messageId === "string" ? params.messageId : undefined;
+    if (!messageId) return;
+    const unbound = session.queuedPrompts.find(
+      (q) => q.messageId === undefined && !q.cancelled,
+    );
+    if (!unbound) return;
+    unbound.messageId = messageId;
+    session.queueByMessageId.set(messageId, unbound);
+  }
+
+  // hydra-acp/prompt_queue_updated: another client (or us) called
+  // hydra-acp/update_prompt to rewrite a queued prompt's content.
+  // Refresh the Slack indicator text to reflect the new prompt — both
+  // for our own queued entries (cross-client edits reach us) and as a
+  // general consistency check when peers edit prompts that happen to
+  // be visible in our thread.
+  private async handlePromptQueueUpdated(
+    sessionId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const messageId =
+      typeof params.messageId === "string" ? params.messageId : undefined;
+    if (!messageId) return;
+    const entry = session.queueByMessageId.get(messageId);
+    if (!entry) return;
+    const blocks = Array.isArray(params.prompt) ? params.prompt : [];
+    let text = "";
+    for (const block of blocks) {
+      if (block && typeof block === "object") {
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") {
+          text += b.text;
+        }
+      }
+    }
+    if (!text) return;
+    entry.text = text;
+    if (entry.promptTs) {
+      await this.opts.thread
+        .updateMessage(
+          session.channel,
+          entry.promptTs,
+          `:hourglass: _queued (edited):_ ${formatPromptPreview(text)}`,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  // hydra-acp/prompt_queue_removed: a queued entry left the queue.
+  // reason = "started" lines up with the local chain's
+  // markQueueIndicatorProcessing path (no extra work needed — the
+  // local chain owns that transition for own-prompts). reason =
+  // "cancelled" or "abandoned" indicate the entry got dropped server-
+  // side; mirror that into the Slack indicator so cross-client cancels
+  // (e.g. someone clicked × on the browser bubble) reflect here too.
+  private async handlePromptQueueRemoved(
+    sessionId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const messageId =
+      typeof params.messageId === "string" ? params.messageId : undefined;
+    if (!messageId) return;
+    const entry = session.queueByMessageId.get(messageId);
+    if (!entry) return;
+    const reason = typeof params.reason === "string" ? params.reason : "";
+    if (reason === "cancelled" || reason === "abandoned") {
+      // The local chain hasn't yet fired its cancellation code path
+      // (this notification IS hydra telling us). Mark cancelled and
+      // splice from the per-session queuedPromptCount so subsequent
+      // prompts get the right "ahead" count.
+      if (!entry.cancelled) {
+        entry.cancelled = true;
+        session.queuedPromptCount = Math.max(
+          0,
+          session.queuedPromptCount - 1,
+        );
+      }
+      session.queueByMessageId.delete(messageId);
+      if (entry.promptTs) {
+        await this.opts.thread
+          .updateMessage(
+            session.channel,
+            entry.promptTs,
+            `:x: _cancelled (queued):_ ${formatPromptPreview(entry.text)}`,
+          )
+          .catch(() => undefined);
+      }
+    } else if (reason === "started") {
+      // The local chain handles the transition to "processing" for own
+      // prompts. Just drop the messageId binding — the chain owns the
+      // entry's lifecycle from here.
+      session.queueByMessageId.delete(messageId);
+    }
   }
 
   private async applyTitle(sessionId: string, title: string): Promise<void> {
@@ -1936,6 +2086,20 @@ export class SessionBridge {
           log.info(
             `queue-cancel <- slack ${sessionId.slice(0, 8)}: ${queued.text.slice(0, 80)}`,
           );
+          // If the entry has been bound to a server messageId
+          // (prompt_queue_added arrived already), use hydra-acp/
+          // cancel_prompt so peers see the prompt_queue_removed
+          // broadcast and tear down their own indicators. Otherwise
+          // the local chain catches the cancelled flag at the next
+          // tick and skips sending to hydra entirely — nothing to
+          // cancel server-side.
+          if (queued.messageId) {
+            this.opts.attach.notify("hydra-acp/cancel_prompt", {
+              sessionId,
+              messageId: queued.messageId,
+            });
+            session.queueByMessageId.delete(queued.messageId);
+          }
           await this.opts.thread
             .updateMessage(
               session.channel,

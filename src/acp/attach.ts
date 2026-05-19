@@ -54,6 +54,10 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
   private lastFrameAt = 0;
   private _agentInfo: { name?: string; version?: string } | undefined;
   private _attachMeta: Record<string, unknown> | undefined;
+  // clientId hydra assigned us on session/attach. Lets the bridge
+  // recognize its own hydra-acp/prompt_queue_added events (so peer-
+  // originated queue events don't trigger local-entry binding).
+  private _clientId: string | undefined;
 
   constructor(private readonly opts: AttachOptions) {
     super();
@@ -80,6 +84,10 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
 
   get attachMeta(): Record<string, unknown> | undefined {
     return this._attachMeta;
+  }
+
+  get clientId(): string | undefined {
+    return this._clientId;
   }
 
   start(): void {
@@ -238,6 +246,7 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
     try {
       const attachResult = await this.request<{
         sessionId: string;
+        clientId?: string;
         replayed?: number;
         _meta?: Record<string, unknown>;
       }>("session/attach", {
@@ -246,6 +255,7 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
         clientInfo: { name: "hydra-acp-slack", version: pkg.version },
       });
       this._attachMeta = attachResult._meta;
+      this._clientId = attachResult.clientId;
       const hydraMeta = (attachResult._meta?.["hydra-acp"] ?? {}) as {
         agentId?: string;
       };
