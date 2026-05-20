@@ -10,6 +10,17 @@ export interface HydraSessionInfo {
   attachedClients: number;
   updatedAt: string;
   status: "live" | "cold";
+  // Set when the session was created by an archiver import. Combined
+  // with upstreamSessionId in the createSession check below: a session
+  // is only "foreign" (skipped by slack) when it's imported AND has
+  // never been bound to a local agent. Once a local agent attaches,
+  // upstreamSessionId becomes non-empty and the session graduates to
+  // local — slack starts reflecting it like any other.
+  importedFromMachine?: string;
+  // Local agent-side session id once an ACP agent has bound this
+  // session on this machine. Empty for passive mirrors that the
+  // archiver imported but the user hasn't opened yet.
+  upstreamSessionId?: string;
 }
 
 export interface HydraDiscoveryOptions {

@@ -277,6 +277,15 @@ export interface SessionBridgeOptions {
     cwd: string | undefined;
     title: string | undefined;
     agentId: string | undefined;
+    // Set when the session was imported from another machine. A
+    // session is treated as foreign — and thus skipped by slack —
+    // only when this is set AND upstreamSessionId is empty (passive
+    // mirror). Once a local agent binds upstreamSessionId, the
+    // session graduates to local and slack reflects it normally.
+    importedFromMachine?: string;
+    // Local ACP agent's session id once one has bound this session
+    // here. Empty for passive mirrors.
+    upstreamSessionId?: string;
   };
   // Messages buffered while the bridge wasn't yet up — typed in slack
   // against a cold thread (resurrection path) or queued by !session for
@@ -1265,6 +1274,22 @@ export class SessionBridge {
     sessionId: string,
     params: Record<string, unknown>,
   ): Promise<SessionState | undefined> {
+    // Passive mirrors — imported from another machine and not yet
+    // touched on this one (no local ACP agent has bound them) — are
+    // skipped entirely: no thread, no event forwarding. Once the user
+    // attaches locally and upstreamSessionId is populated, the session
+    // graduates to local and slack treats it like any other. Downstream
+    // code reads `undefined` here as "skip".
+    if (
+      this.opts.sessionMeta.importedFromMachine &&
+      !this.opts.sessionMeta.upstreamSessionId
+    ) {
+      log.info(
+        `skipping Slack thread for foreign sessionId=${sessionId} ` +
+          `(passive mirror from ${this.opts.sessionMeta.importedFromMachine})`,
+      );
+      return undefined;
+    }
     // Prefer cwd from the live notification, fall back to the
     // sessionMeta hydra discovery handed us at construction time.
     const known = this.opts.sessionMeta;

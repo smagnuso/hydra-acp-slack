@@ -85,6 +85,8 @@ async function main(): Promise<void> {
           cwd: session.cwd,
           title: session.title,
           agentId: session.agentId,
+          importedFromMachine: session.importedFromMachine,
+          upstreamSessionId: session.upstreamSessionId,
         },
         initialMessages,
       });
