@@ -573,17 +573,6 @@ export class SessionBridge {
     const sessionId = params.sessionId as string | undefined;
     log.debug(`request ${r.method} sessionId=${sessionId ?? "(none)"}`);
 
-    // fs/* always answered (whether replayed or live) so the agent doesn't
-    // hang waiting for a response. Primary frontends already handle these.
-    if (r.method.startsWith("fs/")) {
-      this.opts.attach.replyError(
-        r.id,
-        -32601,
-        "fs/* not supported by hydra-acp-slack secondary",
-      );
-      return;
-    }
-
     if (!this.live) {
       // Replayed permission requests are stale (already resolved by the
       // primary). Drop without responding — the proxy will route any
@@ -595,6 +584,11 @@ export class SessionBridge {
       await this.handlePermissionRequest(r, sessionId, params);
       return;
     }
+
+    // hydra-acp broadcasts agent→client requests to every attached
+    // client and resolves on the first response. Anything else (fs/*,
+    // terminal/*, ...) belongs to a primary frontend — we stay silent
+    // so we don't race it with an error.
   }
 
   private async handleSessionUpdate(
