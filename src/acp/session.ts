@@ -78,6 +78,27 @@ interface QueuedPromptEntry {
   // for prompt_queue_updated to refresh the Slack indicator text when
   // another client edits this queued prompt.
   messageId?: string;
+  // ts of the user's original Slack message (the one they typed).
+  // Distinct from promptTs (which is the bot's `_queued_` indicator).
+  // Populated when the message handler passes it through; lets edits
+  // and deletes of the source message reach this entry.
+  sourceSlackTs?: string;
+  // Captured at enqueue time. We need these to rebuild the prompt
+  // blocks on update_prompt — Slack edits only update text, so any
+  // images attached to the original message must be re-sent unchanged.
+  imageBlocks: ReadonlyArray<{ type: "image"; mimeType: string; data: string }>;
+  // Captured at enqueue time so handlePromptQueueUpdated can re-render
+  // the indicator with the same "· N ahead" suffix the original post
+  // showed. Without this, edits silently drop the suffix and the user
+  // loses queue-position context after editing a queued prompt.
+  initialAheadCount: number;
+  // Pending text edit that arrived before messageId was bound. Applied
+  // in handlePromptQueueAdded after FIFO binding completes.
+  pendingEditText?: string;
+  // True if a message_deleted arrived before binding. Applied in
+  // handlePromptQueueAdded by firing cancel_prompt immediately after
+  // binding.
+  pendingCancel?: boolean;
 }
 
 // Tracks a Slack indicator we posted for a PEER-originated queued
@@ -154,6 +175,18 @@ interface SessionState {
   // both for live prompt_queue_added events from peers and for
   // attach-snapshot hydration on first connection.
   peerQueueByMessageId: Map<string, PeerQueueIndicator>;
+  // sourceSlackTs → own queued entry. Populated when sendUserPrompt
+  // is called with a sourceSlackTs; cleaned on entry removal. Used by
+  // the Slack message_changed / message_deleted handlers to find the
+  // entry corresponding to an edited or deleted source message.
+  sourceTsToEntry: Map<string, QueuedPromptEntry>;
+  // ts of the bot's `_processing …_` indicator for the currently-
+  // running own prompt (the message posted by
+  // markQueueIndicatorProcessing). Tracked so `:stop_sign:` reactions
+  // on it can fire session/cancel, matching the gesture available on
+  // the spinner. Singleton per session — one prompt runs at a time.
+  // Cleared in finalizeSpinnerWork at turn end.
+  processingTs: string | undefined;
   // Streaming user message from another frontend attached to the same
   // session (e.g. the editor's stdio shim). Same flush model as agent.
   userChunks: string[];
@@ -1188,6 +1221,7 @@ export class SessionBridge {
     session.turnToolCallIds = [];
     session.spinnerStartedAt = undefined;
     session.planTs = undefined;
+    session.processingTs = undefined;
     // Delete the in-progress spinner (where it originally posted, mid-turn)
     // and post a fresh "Ready" marker at the bottom of the thread. One
     // turn-boundary message instead of two — and the bottom marker is the
@@ -1302,6 +1336,8 @@ export class SessionBridge {
       queuedPrompts: [],
       queueByMessageId: new Map(),
       peerQueueByMessageId: new Map(),
+      sourceTsToEntry: new Map(),
+      processingTs: undefined,
       userChunks: [],
       title: undefined,
       cwd,
@@ -1388,6 +1424,58 @@ export class SessionBridge {
       if (!unbound) return;
       unbound.messageId = messageId;
       session.queueByMessageId.set(messageId, unbound);
+      // Drain any pending edit/delete that arrived from a Slack
+      // message_changed / message_deleted before binding completed.
+      // Cancel wins over edit — deleting after editing should not
+      // leave a queued prompt running.
+      if (unbound.pendingCancel) {
+        unbound.pendingCancel = false;
+        log.info(
+          `queue-cancel pending->fire ${sessionId.slice(0, 8)} mid=${messageId.slice(0, 8)}`,
+        );
+        void this.opts.attach
+          .request("hydra-acp/cancel_prompt", {
+            sessionId,
+            messageId,
+          })
+          .catch((err: unknown) => {
+            log.warn(
+              `cancel_prompt (pending) failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+            );
+          });
+        session.queueByMessageId.delete(messageId);
+        return;
+      }
+      if (unbound.pendingEditText !== undefined) {
+        const newText = unbound.pendingEditText;
+        unbound.pendingEditText = undefined;
+        unbound.text = newText;
+        log.info(
+          `queue-edit pending->fire ${sessionId.slice(0, 8)} mid=${messageId.slice(0, 8)}: ${newText.slice(0, 80)}`,
+        );
+        const prompt: Array<Record<string, unknown>> = [];
+        if (newText) {
+          prompt.push({ type: "text", text: newText });
+        }
+        for (const img of unbound.imageBlocks) {
+          prompt.push({
+            type: "image",
+            mimeType: img.mimeType,
+            data: img.data,
+          });
+        }
+        void this.opts.attach
+          .request("hydra-acp/update_prompt", {
+            sessionId,
+            messageId,
+            prompt,
+          })
+          .catch((err: unknown) => {
+            log.warn(
+              `update_prompt (pending) failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+            );
+          });
+      }
       return;
     }
     await this.postPeerQueueIndicator(session, {
@@ -1488,11 +1576,13 @@ export class SessionBridge {
     if (ownEntry) {
       ownEntry.text = text;
       if (ownEntry.promptTs) {
+        // Reuse the original "· N ahead" suffix so editing doesn't
+        // silently drop queue-position context.
         await this.opts.thread
           .updateMessage(
             session.channel,
             ownEntry.promptTs,
-            `:hourglass: _queued (edited):_ ${formatPromptPreview(text)}`,
+            `:hourglass: _queued${formatAheadSuffix(ownEntry.initialAheadCount)}:_ ${formatPromptPreview(text)}`,
           )
           .catch(() => undefined);
       }
@@ -1501,11 +1591,13 @@ export class SessionBridge {
     const peer = session.peerQueueByMessageId.get(messageId);
     if (peer) {
       peer.text = text;
+      // Peer indicators never had an "ahead" suffix in postPeerQueueIndicator,
+      // so re-render without one to stay visually consistent.
       await this.opts.thread
         .updateMessage(
           session.channel,
           peer.promptTs,
-          `:hourglass: _queued (edited):_ ${formatPromptPreview(text)}`,
+          `:hourglass: _queued:_ ${formatPromptPreview(text)}`,
         )
         .catch(() => undefined);
     }
@@ -1555,11 +1647,20 @@ export class SessionBridge {
         // the prompt waited for at least one other turn).
         ownEntry.started = true;
         if (ownEntry.promptTs) {
+          // Stash the new `_processing …_` ts on the session so
+          // `:stop_sign:` on it can route to session/cancel (matching
+          // the spinner gesture for the same running turn).
           void this.markQueueIndicatorProcessing(
             session,
             ownEntry.promptTs,
             ownEntry.text,
-          ).catch(() => undefined);
+          )
+            .then((processingTs) => {
+              if (processingTs) {
+                session.processingTs = processingTs;
+              }
+            })
+            .catch(() => undefined);
         }
         session.queueByMessageId.delete(messageId);
       }
@@ -1929,6 +2030,7 @@ export class SessionBridge {
     sessionId: string,
     text: string,
     images: ReadonlyArray<{ type: "image"; mimeType: string; data: string }> = [],
+    sourceSlackTs?: string,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -1969,8 +2071,14 @@ export class SessionBridge {
       promptTs: undefined,
       cancelled: false,
       started: false,
+      sourceSlackTs,
+      imageBlocks: images,
+      initialAheadCount: aheadCount,
     };
     session.queuedPrompts.push(queuedEntry);
+    if (sourceSlackTs) {
+      session.sourceTsToEntry.set(sourceSlackTs, queuedEntry);
+    }
 
     // Post the queued indicator (fire-and-forget; the ts lands on
     // queuedEntry when the API call resolves). Skipped when nothing's
@@ -2033,6 +2141,12 @@ export class SessionBridge {
       if (idx >= 0) {
         session.queuedPrompts.splice(idx, 1);
       }
+      if (
+        queuedEntry.sourceSlackTs &&
+        session.sourceTsToEntry.get(queuedEntry.sourceSlackTs) === queuedEntry
+      ) {
+        session.sourceTsToEntry.delete(queuedEntry.sourceSlackTs);
+      }
     }
 
     // When we are the originator, hydra excludes us from the
@@ -2046,6 +2160,19 @@ export class SessionBridge {
     log.info(
       `own-turn end ${sessionId.slice(0, 8)}${stopReason ? ` (${stopReason})` : ""}`,
     );
+    // Skip the finalize tail entirely when this entry was cancelled
+    // before it ever ran. The daemon resolves its session/prompt
+    // awaiter with stopReason:"cancelled" as soon as cancelQueuedPrompt
+    // splices the queue entry — but the spinner / agent state belongs
+    // to whichever turn is *actually* running (a sibling we don't own).
+    // Finalizing here would steal that sibling's spinner ts and post a
+    // bogus ":no_entry: cancelled · N tool · Ts" Ready marker
+    // attributing the running turn's tool count and elapsed time to
+    // our cancellation. Fires for both delete-via-Slack and
+    // :stop_sign:-on-queued-indicator gestures.
+    if (!queuedEntry.started && queuedEntry.cancelled) {
+      return;
+    }
     const tail = this.notificationChain.then(async () => {
       await this.flushAgentMessage(session);
       this.closeAgentMessage(session);
@@ -2053,6 +2180,147 @@ export class SessionBridge {
     });
     this.notificationChain = tail.catch(() => undefined);
     await tail;
+  }
+
+  // Slack message_changed of a previously-queued prompt: route the new
+  // text through hydra-acp/update_prompt so the queued entry's prompt
+  // gets rewritten before it runs. Lookup is keyed by the user's
+  // original Slack `ts` (the message they edited), stamped onto the
+  // entry at enqueue time. Mirrors the daemon-side updateQueuedPrompt
+  // primitive — already exercised by TUI/browser edits that round-trip
+  // through prompt_queue_updated.
+  async editQueuedPromptBySourceTs(
+    sessionId: string,
+    sourceSlackTs: string,
+    newText: string,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const entry = session.sourceTsToEntry.get(sourceSlackTs);
+    if (!entry) return;
+    if (entry.cancelled) return;
+    if (entry.started) {
+      // Already running. Daemon would return `already_running`; the
+      // user has the `:stop_sign:` gesture (on either the
+      // `_processing …_` indicator or the spinner) for that case.
+      log.info(
+        `queue-edit skip (started) <- slack ${sessionId.slice(0, 8)}: ${newText.slice(0, 80)}`,
+      );
+      return;
+    }
+    if (!entry.messageId) {
+      // Not yet bound to a server messageId. Stash; reconciled in
+      // handlePromptQueueAdded once binding completes.
+      entry.pendingEditText = newText;
+      log.info(
+        `queue-edit pending (unbound) <- slack ${sessionId.slice(0, 8)}: ${newText.slice(0, 80)}`,
+      );
+      return;
+    }
+    log.info(
+      `queue-edit <- slack ${sessionId.slice(0, 8)} mid=${entry.messageId.slice(0, 8)}: ${newText.slice(0, 80)}`,
+    );
+    // Update the local text immediately so the FIFO-binding race for
+    // a follow-up edit (or a subsequent suppress-own-prompt check) sees
+    // the latest copy.
+    entry.text = newText;
+    const prompt: Array<Record<string, unknown>> = [];
+    if (newText) {
+      prompt.push({ type: "text", text: newText });
+    }
+    for (const img of entry.imageBlocks) {
+      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
+    }
+    void this.opts.attach
+      .request("hydra-acp/update_prompt", {
+        sessionId,
+        messageId: entry.messageId,
+        prompt,
+      })
+      .catch((err: unknown) => {
+        log.warn(
+          `update_prompt failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+        );
+      });
+  }
+
+  // Slack message_deleted of a previously-queued prompt: route to
+  // hydra-acp/cancel_prompt so the entry is dropped from the daemon's
+  // queue before it runs. Symmetric with the `:stop_sign:`-reaction
+  // cancel path at handleReaction's queued branch — same wire call,
+  // just a different Slack-side trigger.
+  async cancelQueuedPromptBySourceTs(
+    sessionId: string,
+    sourceSlackTs: string,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const entry = session.sourceTsToEntry.get(sourceSlackTs);
+    if (!entry) return;
+    if (entry.cancelled) return;
+    if (entry.started) {
+      // Already running — deletion-as-interrupt would be a surprising
+      // side effect of an accidental delete. The user has explicit
+      // gestures (`:stop_sign:` on the `_processing …_` indicator or
+      // the spinner) for stopping a running turn.
+      log.info(
+        `queue-cancel skip (started) <- slack-delete ${sessionId.slice(0, 8)}`,
+      );
+      return;
+    }
+    // Optimistic local mark, matching the reaction path. Even if we
+    // raced past binding, the in-flight session/prompt response will
+    // just resolve and the entry will be cleaned up by the finally.
+    entry.cancelled = true;
+    if (!entry.messageId) {
+      entry.pendingCancel = true;
+      log.info(
+        `queue-cancel pending (unbound) <- slack-delete ${sessionId.slice(0, 8)}`,
+      );
+      return;
+    }
+    log.info(
+      `queue-cancel <- slack-delete ${sessionId.slice(0, 8)} mid=${entry.messageId.slice(0, 8)}: ${entry.text.slice(0, 80)}`,
+    );
+    void this.opts.attach
+      .request("hydra-acp/cancel_prompt", {
+        sessionId,
+        messageId: entry.messageId,
+      })
+      .catch((err: unknown) => {
+        log.warn(
+          `cancel_prompt failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+        );
+      });
+    // Pull the messageId mapping eagerly so the daemon's
+    // prompt_queue_removed broadcast (arriving ~1ms later) sees the
+    // entry as already-handled and skips its indicator-update branch.
+    // We then drive the indicator update inline here. Mirrors the
+    // `:stop_sign:`-reaction path at handleReaction's queued branch —
+    // pre-delete + explicit chat.update — so both gestures produce
+    // identical visual results.
+    const promptTs = entry.promptTs;
+    const cancelledText = entry.text;
+    session.queueByMessageId.delete(entry.messageId);
+    if (promptTs) {
+      await this.opts.thread
+        .updateMessage(
+          session.channel,
+          promptTs,
+          `:x: _cancelled (queued):_ ${formatPromptPreview(cancelledText)}`,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  // True if this bridge has a queued (or about-to-be-queued) own entry
+  // for the given source Slack ts. Used by the Slack message handler
+  // to pick the right candidate bridge for an edit/delete across a
+  // multi-bridge thread.
+  hasQueueEntryBySourceTs(sessionId: string, sourceSlackTs: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return session.sourceTsToEntry.has(sourceSlackTs);
   }
 
   // Slack-side feedback for a Slack-originated prompt that has to wait
@@ -2068,15 +2336,11 @@ export class SessionBridge {
     if (!session.threadTs) {
       return undefined;
     }
-    const suffix =
-      aheadCount > 0
-        ? ` · ${aheadCount === 1 ? "1 ahead" : `${aheadCount} ahead`}`
-        : "";
     try {
       const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
-        text: `:hourglass: _queued${suffix}:_ ${formatPromptPreview(text)}`,
+        text: `:hourglass: _queued${formatAheadSuffix(aheadCount)}:_ ${formatPromptPreview(text)}`,
       });
       return r.ts;
     } catch (err) {
@@ -2096,12 +2360,12 @@ export class SessionBridge {
     session: SessionState,
     ts: string,
     text: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     await this.opts.thread
       .deleteMessage(session.channel, ts)
       .catch(() => undefined);
     if (!session.threadTs) {
-      return;
+      return undefined;
     }
     // Number of own prompts still queued behind this one. queuedPrompts
     // includes the currently-running entry (us) until our finally
@@ -2112,17 +2376,19 @@ export class SessionBridge {
       waiting > 0
         ? ` · ${waiting === 1 ? "1 waiting" : `${waiting} waiting`}`
         : "";
-    await this.opts.thread
-      .postMessage({
+    try {
+      const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
         text: `:arrow_forward: _processing${suffix}:_ ${formatPromptPreview(text)}`,
-      })
-      .catch((err: unknown) => {
-        log.warn(
-          `processing indicator post failed: ${(err as Error).message}`,
-        );
       });
+      return r.ts;
+    } catch (err) {
+      log.warn(
+        `processing indicator post failed: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
   }
 
   // Permission reaction → session/request_permission response. Takes
@@ -2241,6 +2507,18 @@ export class SessionBridge {
               .catch(() => undefined);
             return;
           }
+        }
+        // `_processing …_` indicator cancel: same wire call as the
+        // spinner branch below. session/cancel is turn-scoped so the
+        // daemon doesn't care which indicator the user reacted on; we
+        // accept either as a stop gesture for the running turn. This
+        // closes the asymmetry where the queued indicator was a valid
+        // `:stop_sign:` target but its `_processing …_` successor was
+        // not — the user had to chase the spinner instead.
+        if (session.processingTs === ts) {
+          log.info(`cancel <- slack (processing) ${sessionId.slice(0, 8)}`);
+          this.opts.attach.notify("session/cancel", { sessionId });
+          return;
         }
         // Spinner cancel: send session/cancel for the running turn.
         // The agent's response (stopReason "cancelled") flows through
@@ -2713,6 +2991,18 @@ function formatPromptPreview(text: string): string {
     return trimmed;
   }
   return `${trimmed.slice(0, 200)}…`;
+}
+
+// Render the "· N ahead" tail that follows the `_queued` italic prefix
+// in the queued-indicator string. Centralized so the new-prompt post
+// (postQueueIndicator) and the edit-time refresh (handlePromptQueueUpdated)
+// stay in sync. Empty string when nothing was ahead at enqueue time —
+// the suffix is omitted entirely rather than rendering "· 0 ahead".
+function formatAheadSuffix(aheadCount: number): string {
+  if (aheadCount <= 0) {
+    return "";
+  }
+  return ` · ${aheadCount === 1 ? "1 ahead" : `${aheadCount} ahead`}`;
 }
 
 // Compact human-readable elapsed-time formatter.

@@ -68,15 +68,50 @@ export function createSlackApp(config: Config): SlackApp {
         url_private?: string;
         url_private_download?: string;
       }>;
+      // For subtype === "message_changed" / "message_deleted", Slack
+      // wraps the new/old content in these envelopes. `message` is the
+      // post-edit version (only on message_changed); `previous_message`
+      // is the pre-edit / deleted message and carries the original ts
+      // and user we need for authorization + queue lookup.
+      message?: {
+        ts?: string;
+        text?: string;
+        user?: string;
+        thread_ts?: string;
+        bot_id?: string;
+      };
+      previous_message?: {
+        ts?: string;
+        text?: string;
+        user?: string;
+        thread_ts?: string;
+        bot_id?: string;
+      };
     }>;
     const preview = (m.text ?? "").slice(0, 60);
     log.info(
       `inbound msg user=${m.user ?? "?"} channel=${m.channel ?? "?"} thread=${m.thread_ts ?? "(none)"} subtype=${m.subtype ?? "(none)"} bot=${m.bot_id ?? "(none)"} ts=${m.ts ?? "?"} text="${preview}"`,
     );
-    if ((m.subtype && m.subtype !== "file_share") || m.bot_id) {
-      log.info(
-        `drop: subtype=${m.subtype ?? "(none)"} bot=${m.bot_id ?? "(none)"}`,
-      );
+    if (m.bot_id) {
+      log.info(`drop: bot=${m.bot_id}`);
+      return;
+    }
+    // Slack delivers edits as subtype="message_changed" and deletions as
+    // subtype="message_deleted". Both target a previously-queued prompt
+    // by its source `ts`; route to dedicated handlers and skip the
+    // normal enqueue path. Any other subtype (file_share is the one
+    // we *do* accept on the main path; everything else — channel_join,
+    // bot_message, thread_broadcast, etc. — is dropped).
+    if (m.subtype === "message_changed") {
+      await handleMessageChanged(app, config, m);
+      return;
+    }
+    if (m.subtype === "message_deleted") {
+      await handleMessageDeleted(app, config, m);
+      return;
+    }
+    if (m.subtype && m.subtype !== "file_share") {
+      log.info(`drop: subtype=${m.subtype}`);
       return;
     }
     if (!m.channel || !m.user || !m.ts) {
@@ -203,6 +238,7 @@ export function createSlackApp(config: Config): SlackApp {
           candidate.sessionId,
           forwardedText,
           imageBlocks,
+          m.ts,
         );
         threadRegistry.promote(candidate.bridge, m.channel, m.thread_ts);
         routed = true;
@@ -569,4 +605,159 @@ async function handleAgents(
     thread_ts: ts,
     text: ["*Available agents:*", ...lines].join("\n"),
   });
+}
+
+// Shared shape for the inbound Slack `message` event with the subtype
+// envelopes we care about (message_changed wraps the new/old version;
+// message_deleted only carries previous_message).
+type SlackMessageEnvelope = Partial<{
+  subtype?: string;
+  channel?: string;
+  ts?: string;
+  text?: string;
+  user?: string;
+  thread_ts?: string;
+  message?: {
+    ts?: string;
+    text?: string;
+    user?: string;
+    thread_ts?: string;
+    bot_id?: string;
+  };
+  previous_message?: {
+    ts?: string;
+    text?: string;
+    user?: string;
+    thread_ts?: string;
+    bot_id?: string;
+  };
+}>;
+
+// Slack edit of a previously-queued prompt → hydra-acp/update_prompt.
+// Only fires when:
+//   * the edited message lives in a bridged thread
+//   * there's an own queued entry stamped with this source ts
+//   * the entry hasn't started yet
+// Anything else is silently ignored: messages we never queued
+// (e.g. bang-routed `!agents`, drops, peer-originated prompts) won't
+// have an entry; messages that already ran will have been spliced
+// out of `sourceTsToEntry` by sendUserPrompt's finally.
+async function handleMessageChanged(
+  app: bolt.App,
+  config: Config,
+  m: SlackMessageEnvelope,
+): Promise<void> {
+  const prev = m.previous_message;
+  const next = m.message;
+  // Bot-authored messages are dropped — `bot_id` lives inside the
+  // nested envelopes for these subtypes, not on the outer event.
+  // Without this filter we'd process every spinner / queue indicator
+  // edit the bridge itself performs (chat.update fires message_changed
+  // back to us; spinner deletion fires message_deleted back).
+  if (next?.bot_id || prev?.bot_id) {
+    return;
+  }
+  // Slack delivers message_changed with both envelopes; we need the
+  // original ts (lookup key) and the post-edit text. Channel is on
+  // the outer event.
+  const sourceTs = prev?.ts ?? next?.ts;
+  const channel = m.channel;
+  const newText = (next?.text ?? "").trim();
+  const editorUser = next?.user ?? prev?.user;
+  if (!channel || !sourceTs) {
+    return;
+  }
+  // Edits from unauthorized users are dropped — same gate as new
+  // messages. Slack actually wraps the editor in next.user but we
+  // accept either as a safety net for unusual delivery shapes.
+  if (
+    config.authorizedUsers.size > 0 &&
+    editorUser &&
+    !config.authorizedUsers.has(editorUser)
+  ) {
+    return;
+  }
+  // The edit must be inside a bridged thread. Slack puts the parent ts
+  // on prev/next.thread_ts (and not on the outer event for these
+  // subtypes).
+  const threadTs = next?.thread_ts ?? prev?.thread_ts;
+  if (!threadTs) {
+    return;
+  }
+  const candidates = threadRegistry.lookupAll(channel, threadTs);
+  if (candidates.length === 0) {
+    return;
+  }
+  // Pick the candidate that actually has an entry for this source ts.
+  // Multi-bridge threads are rare but we shouldn't fire update_prompt
+  // at the wrong session.
+  const candidate = candidates.find((c) =>
+    c.bridge.hasQueueEntryBySourceTs(c.sessionId, sourceTs),
+  );
+  if (!candidate) {
+    return;
+  }
+  log.info(
+    `edit -> ${candidate.sessionId.slice(0, 8)} ts=${sourceTs}: ${newText.slice(0, 80)}`,
+  );
+  await candidate.bridge
+    .editQueuedPromptBySourceTs(candidate.sessionId, sourceTs, newText)
+    .catch((err: unknown) => {
+      log.warn(
+        `editQueuedPromptBySourceTs failed: ${(err as Error).message}`,
+      );
+    });
+}
+
+// Slack delete of a previously-queued prompt → hydra-acp/cancel_prompt.
+// Symmetric with handleMessageChanged: same lookup, same skip rules,
+// just routed to the cancel primitive.
+async function handleMessageDeleted(
+  app: bolt.App,
+  config: Config,
+  m: SlackMessageEnvelope,
+): Promise<void> {
+  const prev = m.previous_message;
+  // Drop the bot's own deletions (its spinner cleanup, queue indicator
+  // updates, etc.) — Slack echoes those back to us as message_deleted
+  // events and they shouldn't be treated as user delete gestures.
+  if (prev?.bot_id) {
+    return;
+  }
+  const sourceTs = prev?.ts;
+  const channel = m.channel;
+  if (!channel || !sourceTs) {
+    return;
+  }
+  if (
+    config.authorizedUsers.size > 0 &&
+    prev?.user &&
+    !config.authorizedUsers.has(prev.user)
+  ) {
+    return;
+  }
+  const threadTs = prev?.thread_ts;
+  if (!threadTs) {
+    return;
+  }
+  const candidates = threadRegistry.lookupAll(channel, threadTs);
+  if (candidates.length === 0) {
+    return;
+  }
+  const candidate = candidates.find((c) =>
+    c.bridge.hasQueueEntryBySourceTs(c.sessionId, sourceTs),
+  );
+  if (!candidate) {
+    return;
+  }
+  log.info(
+    `delete -> ${candidate.sessionId.slice(0, 8)} ts=${sourceTs}`,
+  );
+  await candidate.bridge
+    .cancelQueuedPromptBySourceTs(candidate.sessionId, sourceTs)
+    .catch((err: unknown) => {
+      log.warn(
+        `cancelQueuedPromptBySourceTs failed: ${(err as Error).message}`,
+      );
+    });
 }
