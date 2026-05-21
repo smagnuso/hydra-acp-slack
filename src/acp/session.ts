@@ -2754,13 +2754,29 @@ export class SessionBridge {
       // Normalize: protocol may advertise either bare ("create_plan")
       // or slash-prefixed ("/hydra title") names. Store slash-prefixed
       // so the bang→slash mapping is a direct lookup.
-      const name = entry.name.startsWith("/")
+      //
+      // Some agents (hydra's own /hydra commands; see
+      // cli/src/core/hydra-commands.ts:hydraCommandsAsAdvertised)
+      // concatenate the args-hint into the name field — the wire-level
+      // string is literally `hydra agent <agent>`. Strip the trailing
+      // `<…>` tokens so the map key is the bare verb (`/hydra agent`),
+      // which is what matchKnownCommand needs to compare against the
+      // user's actual input. The original argsHint is preserved in the
+      // description prefix so the unknown-command listing still shows
+      // it.
+      const rawName = entry.name.startsWith("/")
         ? entry.name
         : `/${entry.name}`;
-      const desc =
+      const { name, argsHint } = stripCommandArgsHint(rawName);
+      const baseDesc =
         typeof entry.description === "string"
           ? entry.description
           : undefined;
+      const desc = argsHint
+        ? baseDesc
+          ? `${argsHint} — ${baseDesc}`
+          : argsHint
+        : baseDesc;
       next.set(name, desc);
     }
     const session = this.sessions.get(sessionId);
@@ -2798,6 +2814,31 @@ export class SessionBridge {
 function isAvailableCommandsUpdate(params: Record<string, unknown>): boolean {
   const update = (params.update ?? {}) as { sessionUpdate?: unknown };
   return update.sessionUpdate === "available_commands_update";
+}
+
+// Split an advertised command name into the verb portion and any
+// trailing args-hint tokens. `<…>` placeholders get peeled off; the
+// remaining tail (after the last hint) is treated as still part of the
+// verb so descriptive suffixes survive. E.g.:
+//   "/hydra agent <agent>"      → { name: "/hydra agent", argsHint: "<agent>" }
+//   "/hydra title"              → { name: "/hydra title", argsHint: undefined }
+//   "/foo <a> <b>"              → { name: "/foo",          argsHint: "<a> <b>" }
+export function stripCommandArgsHint(raw: string): {
+  name: string;
+  argsHint: string | undefined;
+} {
+  const tokens = raw.split(/\s+/);
+  let i = tokens.length;
+  while (i > 0 && /^<[^>]*>$/.test(tokens[i - 1] ?? "")) {
+    i--;
+  }
+  if (i === tokens.length) {
+    return { name: raw, argsHint: undefined };
+  }
+  return {
+    name: tokens.slice(0, i).join(" "),
+    argsHint: tokens.slice(i).join(" "),
+  };
 }
 
 // Render the thread's parent-message text. Always includes

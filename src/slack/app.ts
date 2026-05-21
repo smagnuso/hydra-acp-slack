@@ -451,7 +451,18 @@ async function postUnknownCommandReply(
   const list =
     names.length === 0
       ? "_(no commands advertised yet — try again after the agent emits its command list)_"
-      : names.map((n) => `• \`!${n.slice(1)}\``).join("\n");
+      : names
+          .map((n) => {
+            const desc = known.get(n);
+            // The args-hint (e.g. "<agent>") is folded into the
+            // description by applyAvailableCommandsUpdate; surface the
+            // first `<…>` token in the bang line so users know to
+            // supply an argument.
+            const hintMatch = desc?.match(/^(<[^>]*>(?:\s+<[^>]*>)*)/);
+            const hint = hintMatch ? ` ${hintMatch[1]}` : "";
+            return `• \`!${n.slice(1)}${hint}\``;
+          })
+          .join("\n");
   await app.client.chat
     .postMessage({
       channel,
