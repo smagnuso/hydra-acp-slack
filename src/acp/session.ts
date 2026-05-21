@@ -99,6 +99,16 @@ interface QueuedPromptEntry {
   // handlePromptQueueAdded by firing cancel_prompt immediately after
   // binding.
   pendingCancel?: boolean;
+  // Barrier the prompt_queue_removed{started} handler awaits before
+  // posting the Processing indicator for this entry. Captures the
+  // session-level pendingOwnTurnEnd as it was *at the moment this
+  // entry was enqueued* — i.e. the Ready-barrier of whichever own
+  // turn was already running (or none, in which case undefined).
+  // Stashed per-entry instead of read from session at handler time
+  // because by then session.pendingOwnTurnEnd has been chained past
+  // (each sendUserPrompt installs its own barrier synchronously) and
+  // would point to *this* entry's barrier — a self-wait deadlock.
+  waitForPriorReady?: Promise<void>;
 }
 
 // Tracks a Slack indicator we posted for a PEER-originated queued
@@ -236,6 +246,19 @@ interface SessionState {
   // in place rather than posting a fresh message per delta. Cleared
   // at turn end alongside the spinner.
   planTs: string | undefined;
+  // Barrier resolved once the current own-turn's Ready marker has
+  // posted. Set synchronously in sendUserPrompt before we await
+  // session/prompt — so it exists before the daemon's
+  // prompt_queue_removed{started} for the *next* turn can possibly
+  // be observed by handlePromptQueueRemoved. That handler awaits
+  // this barrier before posting the Processing indicator, which is
+  // what keeps Ready (previous turn) → Processing (next turn) in
+  // visual order. Without it the chain ordering between the
+  // session/prompt response continuation and the notification arm
+  // is undefined — the daemon emits prompt_queue_removed{started}
+  // as soon as it dequeues the next prompt, which can happen in the
+  // same tick as the response. Cleared in the tail after Ready posts.
+  pendingOwnTurnEnd: Promise<void> | undefined;
   // True once this daemon run has seen any session/update notification
   // for this session. Eager-attached sessions (materialized from a
   // marker scan at startup) start false and stay false until a real
@@ -1072,17 +1095,28 @@ export class SessionBridge {
       return;
     }
     const text = renderSpinner(session);
+    // Spinner gets a Cancel button always; details-toggle button
+    // appears once at least one tool call has shown up (or if the
+    // user already expanded it via :eyes:, so they can still
+    // collapse). Same boolean controls the rendered tool-list body
+    // in renderSpinner.
+    const blocks = buildSpinnerBlocks(session.sessionId, text, {
+      expanded: session.spinnerExpanded,
+      toolCallCount: session.turnToolCallIds.length,
+    });
     if (session.spinnerTs) {
       await this.opts.thread.updateMessage(
         session.channel,
         session.spinnerTs,
         text,
+        blocks,
       );
     } else {
       const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
         text,
+        blocks,
       });
       session.spinnerTs = r.ts;
       session.spinnerStartedAt = Date.now();
@@ -1216,6 +1250,7 @@ export class SessionBridge {
     stopReason?: string,
   ): Promise<void> {
     const ts = session.spinnerTs;
+    const processingTs = session.processingTs;
     const expanded = session.spinnerExpanded;
     const count = session.turnToolCallIds.length;
     const elapsed = session.spinnerStartedAt
@@ -1251,6 +1286,24 @@ export class SessionBridge {
       .catch((err: unknown) => {
         log.warn(`ready marker post failed: ${(err as Error).message}`);
       });
+    // Strip the Cancel button off the processing indicator after the
+    // Ready marker has posted. The processing message stays in the
+    // thread as scrollback context (it shows which prompt this turn
+    // ran), but its button no longer means anything once the turn is
+    // over — a stale click would fire session/cancel against the
+    // *next* turn. updateMessage without a blocks arg clears the
+    // blocks field via thread.ts's empty-array fallback. Done last so
+    // an extra fetchText round-trip doesn't delay Ready landing.
+    if (processingTs) {
+      const existing = await this.opts.thread
+        .fetchText(session.channel, processingTs)
+        .catch(() => undefined);
+      if (existing) {
+        await this.opts.thread
+          .updateMessage(session.channel, processingTs, existing)
+          .catch(() => undefined);
+      }
+    }
   }
 
   private async ensureSession(
@@ -1377,6 +1430,7 @@ export class SessionBridge {
       spinnerStartedAt: undefined,
       spinnerTicker: undefined,
       planTs: undefined,
+      pendingOwnTurnEnd: undefined,
       hadActivity: false,
       availableCommands: this.pendingCommands.get(sessionId) ?? new Map(),
       agentId: this.opts.sessionMeta.agentId,
@@ -1524,9 +1578,9 @@ export class SessionBridge {
     if (session.peerQueueByMessageId.has(args.messageId)) {
       return;
     }
-    const blocks = Array.isArray(args.prompt) ? args.prompt : [];
+    const promptBlocks = Array.isArray(args.prompt) ? args.prompt : [];
     let text = "";
-    for (const block of blocks) {
+    for (const block of promptBlocks) {
       if (block && typeof block === "object") {
         const b = block as Record<string, unknown>;
         if (b.type === "text" && typeof b.text === "string") {
@@ -1536,12 +1590,13 @@ export class SessionBridge {
     }
     if (!text) return;
     if (!session.threadTs) return;
+    const indicatorText = formatQueuedIndicator(text, 0);
     let promptTs: string | undefined;
     try {
       const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
-        text: `:hourglass: _queued:_ ${formatPromptPreview(text)}`,
+        text: indicatorText,
       });
       promptTs = r.ts;
     } catch (err) {
@@ -1558,6 +1613,12 @@ export class SessionBridge {
         .catch(() => undefined);
       return;
     }
+    // Attach the Block Kit Cancel button now that we know the ts.
+    // Mirrors postQueueIndicator's two-step pattern.
+    const indicatorBlocks = buildQueuedBlocks(session.sessionId, promptTs, indicatorText);
+    await this.opts.thread
+      .updateMessage(session.channel, promptTs, indicatorText, indicatorBlocks)
+      .catch(() => undefined);
     session.peerQueueByMessageId.set(args.messageId, {
       messageId: args.messageId,
       promptTs,
@@ -1600,12 +1661,18 @@ export class SessionBridge {
       ownEntry.text = text;
       if (ownEntry.promptTs) {
         // Reuse the original "· N ahead" suffix so editing doesn't
-        // silently drop queue-position context.
+        // silently drop queue-position context. Re-emit blocks so the
+        // Cancel button stays attached after the edit — without blocks
+        // chat.update wipes them (per thread.updateMessage's empty-
+        // array fallback) and the indicator silently loses its button.
+        const indicatorText = formatQueuedIndicator(text, ownEntry.initialAheadCount);
+        const blocks = buildQueuedBlocks(sessionId, ownEntry.promptTs, indicatorText);
         await this.opts.thread
           .updateMessage(
             session.channel,
             ownEntry.promptTs,
-            `:hourglass: _queued${formatAheadSuffix(ownEntry.initialAheadCount)}:_ ${formatPromptPreview(text)}`,
+            indicatorText,
+            blocks,
           )
           .catch(() => undefined);
       }
@@ -1615,12 +1682,16 @@ export class SessionBridge {
     if (peer) {
       peer.text = text;
       // Peer indicators never had an "ahead" suffix in postPeerQueueIndicator,
-      // so re-render without one to stay visually consistent.
+      // so re-render without one to stay visually consistent. Re-emit
+      // blocks so the Cancel button survives the edit.
+      const indicatorText = formatQueuedIndicator(text, 0);
+      const blocks = buildQueuedBlocks(sessionId, peer.promptTs, indicatorText);
       await this.opts.thread
         .updateMessage(
           session.channel,
           peer.promptTs,
-          `:hourglass: _queued:_ ${formatPromptPreview(text)}`,
+          indicatorText,
+          blocks,
         )
         .catch(() => undefined);
     }
@@ -1658,7 +1729,7 @@ export class SessionBridge {
             .updateMessage(
               session.channel,
               ownEntry.promptTs,
-              `:x: _cancelled (queued):_ ${formatPromptPreview(ownEntry.text)}`,
+              formatCancelledQueuedIndicator(ownEntry.text),
             )
             .catch(() => undefined);
         }
@@ -1670,20 +1741,35 @@ export class SessionBridge {
         // the prompt waited for at least one other turn).
         ownEntry.started = true;
         if (ownEntry.promptTs) {
-          // Stash the new `_processing …_` ts on the session so
-          // `:stop_sign:` on it can route to session/cancel (matching
-          // the spinner gesture for the same running turn).
-          void this.markQueueIndicatorProcessing(
+          // Wait for the previous own turn's Ready marker to post
+          // before posting Processing for this one. The daemon
+          // dequeues the next prompt as soon as the previous turn
+          // resolves, so prompt_queue_removed{started} can arrive on
+          // notificationChain at the same tick as (or before) the
+          // session/prompt response continuation that schedules the
+          // previous turn's finalize tail. Without this barrier
+          // Processing visually precedes Ready in the thread.
+          //
+          // We wait on the *previous* turn's barrier (captured at
+          // enqueue time onto waitForPriorReady), not the current
+          // session.pendingOwnTurnEnd — that already points to our
+          // own turn's barrier (installed by our sendUserPrompt) and
+          // awaiting it would deadlock the next-turn handler against
+          // its own finish.
+          if (ownEntry.waitForPriorReady) {
+            await ownEntry.waitForPriorReady.catch(() => undefined);
+          }
+          // Stash the new processing-indicator ts on the session so
+          // `:stop_sign:` reactions and the Block Kit Cancel button
+          // on it can route to session/cancel.
+          const processingTs = await this.markQueueIndicatorProcessing(
             session,
             ownEntry.promptTs,
             ownEntry.text,
-          )
-            .then((processingTs) => {
-              if (processingTs) {
-                session.processingTs = processingTs;
-              }
-            })
-            .catch(() => undefined);
+          ).catch(() => undefined);
+          if (processingTs) {
+            session.processingTs = processingTs;
+          }
         }
         session.queueByMessageId.delete(messageId);
       }
@@ -1707,7 +1793,7 @@ export class SessionBridge {
         .updateMessage(
           session.channel,
           peer.promptTs,
-          `:x: _cancelled (queued):_ ${formatPromptPreview(peer.text)}`,
+          formatCancelledQueuedIndicator(peer.text),
         )
         .catch(() => undefined);
     }
@@ -2145,6 +2231,29 @@ export class SessionBridge {
       prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
     }
 
+    // Turn-end barrier — must exist before we send session/prompt so
+    // the daemon's prompt_queue_removed{started} for the next turn
+    // (which can arrive on notificationChain as soon as our turn's
+    // session/prompt resolves, including in the same tick) finds it
+    // and waits for our Ready post. Without this, a peer-or-self
+    // queued prompt's Processing indicator can land in the thread
+    // before our Ready marker — see SessionState.pendingOwnTurnEnd.
+    //
+    // Capture the *previous* turn's barrier on the queue entry so the
+    // started-handler waits on the prior Ready, not our own. Then
+    // install our own barrier on the session so the turn-after-us
+    // can find it.
+    const priorBarrier = session.pendingOwnTurnEnd;
+    queuedEntry.waitForPriorReady = priorBarrier;
+    let resolveTurnEnd!: () => void;
+    const ownBarrier = new Promise<void>((resolve) => {
+      resolveTurnEnd = resolve;
+    });
+    const myBarrier: Promise<void> = priorBarrier
+      ? priorBarrier.then(() => ownBarrier)
+      : ownBarrier;
+    session.pendingOwnTurnEnd = myBarrier;
+
     let stopReason: string | undefined;
     try {
       const response = await this.opts.attach.request<{
@@ -2196,15 +2305,31 @@ export class SessionBridge {
     // our cancellation. Fires for both delete-via-Slack and
     // :stop_sign:-on-queued-indicator gestures.
     if (!queuedEntry.started && queuedEntry.cancelled) {
+      // No Ready will post — release the barrier so waiters don't hang.
+      resolveTurnEnd();
+      if (session.pendingOwnTurnEnd === myBarrier) {
+        session.pendingOwnTurnEnd = undefined;
+      }
       return;
     }
-    const tail = this.notificationChain.then(async () => {
+    const finalizeTail = (async () => {
       await this.flushAgentMessage(session);
       this.closeAgentMessage(session);
       await this.finalizeSpinner(session, stopReason);
-    });
-    this.notificationChain = tail.catch(() => undefined);
-    await tail;
+    })();
+    try {
+      await finalizeTail;
+    } finally {
+      // Resolve our barrier so any waiter (e.g. the next-turn's
+      // prompt_queue_removed{started} handler) can proceed. Done in
+      // finally so even an error in finalize doesn't leave the chain
+      // stuck. Clear the session field only if it still points at us
+      // — a later sendUserPrompt may have already chained past.
+      resolveTurnEnd();
+      if (session.pendingOwnTurnEnd === myBarrier) {
+        session.pendingOwnTurnEnd = undefined;
+      }
+    }
   }
 
   // Slack message_changed of a previously-queued prompt: route the new
@@ -2332,10 +2457,140 @@ export class SessionBridge {
         .updateMessage(
           session.channel,
           promptTs,
-          `:x: _cancelled (queued):_ ${formatPromptPreview(cancelledText)}`,
+          formatCancelledQueuedIndicator(cancelledText),
         )
         .catch(() => undefined);
     }
+  }
+
+  // Cancel an own queued entry identified by its indicator's Slack ts.
+  // Returns true if it matched and the cancel was issued; false if no
+  // such entry exists (so a caller can try the next indicator kind).
+  // Mirrors the previous reaction-cancel branch verbatim — same wire
+  // call (`hydra-acp/cancel_prompt`), same indicator update, same
+  // optimistic local mark. Shared between the reaction path and the
+  // Block Kit Cancel button handler.
+  private async cancelOwnQueuedByPromptTs(
+    session: SessionState,
+    promptTs: string,
+  ): Promise<boolean> {
+    const queued = session.queuedPrompts.find(
+      (q) => q.promptTs === promptTs && !q.started && !q.cancelled,
+    );
+    if (!queued) {
+      return false;
+    }
+    queued.cancelled = true;
+    log.info(
+      `queue-cancel <- slack ${session.sessionId.slice(0, 8)}: ${queued.text.slice(0, 80)}`,
+    );
+    // cancel_prompt is a request per the wire spec (the daemon's
+    // onRequest handler returns { cancelled, reason }) so it must go
+    // via attach.request — notify would be a no-op and the entry
+    // would keep running. We don't need the response: the daemon's
+    // prompt_queue_removed{cancelled} broadcast updates every attached
+    // client (including us) to tear down their indicators.
+    if (queued.messageId) {
+      void this.opts.attach
+        .request("hydra-acp/cancel_prompt", {
+          sessionId: session.sessionId,
+          messageId: queued.messageId,
+        })
+        .catch(() => undefined);
+      session.queueByMessageId.delete(queued.messageId);
+    }
+    await this.opts.thread
+      .updateMessage(
+        session.channel,
+        promptTs,
+        formatCancelledQueuedIndicator(queued.text),
+      )
+      .catch(() => undefined);
+    return true;
+  }
+
+  // Cancel a peer's queued entry identified by its indicator's Slack
+  // ts. Same wire call as cancelOwnQueuedByPromptTs; the daemon's
+  // prompt_queue_removed{cancelled} echo drives the indicator update
+  // for everyone (including us via handlePromptQueueRemoved). Returns
+  // true if matched.
+  private async cancelPeerQueuedByPromptTs(
+    session: SessionState,
+    promptTs: string,
+  ): Promise<boolean> {
+    for (const [, peer] of session.peerQueueByMessageId) {
+      if (peer.promptTs === promptTs) {
+        log.info(
+          `peer queue-cancel <- slack ${session.sessionId.slice(0, 8)}: ${peer.text.slice(0, 80)}`,
+        );
+        void this.opts.attach
+          .request("hydra-acp/cancel_prompt", {
+            sessionId: session.sessionId,
+            messageId: peer.messageId,
+          })
+          .catch(() => undefined);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Turn-scoped cancel: fire session/cancel for the currently running
+  // turn. Same effect as a :stop_sign: reaction on the spinner or the
+  // _processing …_ indicator. The agent's response (stopReason
+  // "cancelled") flows through turn_complete (or our await on
+  // session/prompt for own turns) and finalizes the spinner with a
+  // "cancelled" marker.
+  private cancelRunningTurn(session: SessionState): void {
+    this.opts.attach.notify("session/cancel", { sessionId: session.sessionId });
+  }
+
+  // Public entry point for the Block Kit "Cancel" button on a queued
+  // indicator (own or peer). The slack/app.ts action handler decodes
+  // {sessionId, promptTs} from the button value and calls this. Tries
+  // own entries first, then peer entries — matches the reaction-cancel
+  // priority order. Returns true when an entry matched.
+  async cancelQueuedByPromptTs(
+    sessionId: string,
+    promptTs: string,
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return false;
+    }
+    if (await this.cancelOwnQueuedByPromptTs(session, promptTs)) {
+      return true;
+    }
+    return this.cancelPeerQueuedByPromptTs(session, promptTs);
+  }
+
+  // Public entry point for the Block Kit "Cancel" button on the
+  // processing indicator or the spinner. Same wire call as the
+  // :stop_sign: reaction path on those messages.
+  cancelTurn(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return false;
+    }
+    log.info(`cancel <- slack (button) ${sessionId.slice(0, 8)}`);
+    this.cancelRunningTurn(session);
+    return true;
+  }
+
+  // Public entry point for the spinner's "Show details / Hide details"
+  // toggle button. Flips session.spinnerExpanded and refreshes the
+  // spinner so its block re-renders with the inverted label and the
+  // expanded/collapsed body. Same boolean the :eyes: reaction toggles
+  // (handleReaction's expand_truncated branch), so either gesture
+  // converges on the same state.
+  async toggleSpinnerDetails(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.spinnerTs) {
+      return false;
+    }
+    session.spinnerExpanded = !session.spinnerExpanded;
+    await this.refreshSpinner(session).catch(() => undefined);
+    return true;
   }
 
   // True if this bridge has a queued (or about-to-be-queued) own entry
@@ -2353,6 +2608,13 @@ export class SessionBridge {
   // their second/third-in-a-row Slack message land in the thread; the
   // returned ts is later used by markQueueIndicatorProcessing to flip
   // it to "processing" when its turn comes.
+  //
+  // Two-step post: chat.postMessage to learn the ts, then chat.update
+  // with the Block Kit Cancel button keyed by that ts. We can't put
+  // the button on the initial post because the button value needs to
+  // carry the indicator's own ts as the cancel correlator, and Slack
+  // only hands us the ts on the response. Same Slack RTT shape as the
+  // permission prompt — one extra update call per queued indicator.
   private async postQueueIndicator(
     session: SessionState,
     text: string,
@@ -2361,17 +2623,27 @@ export class SessionBridge {
     if (!session.threadTs) {
       return undefined;
     }
+    const indicatorText = formatQueuedIndicator(text, aheadCount);
+    let ts: string | undefined;
     try {
       const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
-        text: `:hourglass: _queued${formatAheadSuffix(aheadCount)}:_ ${formatPromptPreview(text)}`,
+        text: indicatorText,
       });
-      return r.ts;
+      ts = r.ts;
     } catch (err) {
       log.warn(`queue indicator post failed: ${(err as Error).message}`);
       return undefined;
     }
+    if (!ts) {
+      return undefined;
+    }
+    const blocks = buildQueuedBlocks(session.sessionId, ts, indicatorText);
+    await this.opts.thread
+      .updateMessage(session.channel, ts, indicatorText, blocks)
+      .catch(() => undefined);
+    return ts;
   }
 
   // Transition a queued indicator into "processing". Rather than
@@ -2397,15 +2669,17 @@ export class SessionBridge {
     // removes it, so subtract 1. Hidden parenthetical when nothing's
     // queued behind us — keeps the common case clean.
     const waiting = Math.max(0, session.queuedPrompts.length - 1);
-    const suffix =
-      waiting > 0
-        ? ` · ${waiting === 1 ? "1 waiting" : `${waiting} waiting`}`
-        : "";
+    const indicatorText = formatProcessingIndicator(text, waiting);
     try {
+      // Processing cancel is turn-scoped (session/cancel), so the
+      // button doesn't need the indicator's own ts — sessionId is
+      // enough. That lets us post text + blocks in one shot.
+      const blocks = buildProcessingBlocks(session.sessionId, indicatorText);
       const r = await this.opts.thread.postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
-        text: `:arrow_forward: _processing${suffix}:_ ${formatPromptPreview(text)}`,
+        text: indicatorText,
+        blocks,
       });
       return r.ts;
     } catch (err) {
@@ -2503,94 +2777,28 @@ export class SessionBridge {
         if (!added) {
           return;
         }
-        // Queued-prompt cancel: react on the "queued: …" indicator to
-        // splice that specific prompt out of the chain before it runs.
-        // Only valid while the entry is still genuinely waiting —
-        // started=true means the chain has already moved past the
-        // cancellation check, at which point the user should react on
-        // the spinner instead.
-        const queued = session.queuedPrompts.find(
-          (q) => q.promptTs === ts && !q.started && !q.cancelled,
-        );
-        if (queued) {
-          queued.cancelled = true;
-          log.info(
-            `queue-cancel <- slack ${sessionId.slice(0, 8)}: ${queued.text.slice(0, 80)}`,
-          );
-          // Drop the entry from hydra's queue. cancel_prompt is a
-          // request per the wire spec (the daemon's onRequest handler
-          // returns { cancelled, reason }), so it must be sent via
-          // attach.request — using notify here would be a no-op and
-          // the entry would keep running. We don't need the response;
-          // the daemon's prompt_queue_removed{cancelled} broadcast is
-          // what tells every attached client (including us) to tear
-          // down their indicators.
-          //
-          // queued.messageId is set as soon as prompt_queue_added
-          // binds, which lands within milliseconds of sendUserPrompt
-          // firing session/prompt. If the user reacts faster than the
-          // round-trip — vanishingly rare — we have nothing to target
-          // server-side; the optimistic local mark prevents UI
-          // weirdness, and the in-flight session/prompt will just run.
-          if (queued.messageId) {
-            void this.opts.attach
-              .request("hydra-acp/cancel_prompt", {
-                sessionId,
-                messageId: queued.messageId,
-              })
-              .catch(() => undefined);
-            session.queueByMessageId.delete(queued.messageId);
-          }
-          await this.opts.thread
-            .updateMessage(
-              session.channel,
-              ts,
-              `:x: _cancelled (queued):_ ${formatPromptPreview(queued.text)}`,
-            )
-            .catch(() => undefined);
+        // Try the three indicator kinds in order. Each helper returns
+        // true if it owned the ts and handled the cancel; the chain
+        // short-circuits so the spinner branch only runs when nothing
+        // upstream matched. Shared with the Block Kit Cancel button
+        // handlers in slack/app.ts so reaction-cancel and button-cancel
+        // behave identically.
+        if (await this.cancelOwnQueuedByPromptTs(session, ts)) {
           return;
         }
-        // Not one of our own queued entries — maybe it's a peer's
-        // indicator we posted via prompt_queue_added. Find it by ts
-        // and fire hydra-acp/cancel_prompt to drop it from hydra's
-        // queue. The daemon's prompt_queue_removed{cancelled} echo
-        // updates everyone (including this thread) to the cancelled
-        // state.
-        for (const [, peer] of session.peerQueueByMessageId) {
-          if (peer.promptTs === ts) {
-            log.info(
-              `peer queue-cancel <- slack ${sessionId.slice(0, 8)}: ${peer.text.slice(0, 80)}`,
-            );
-            void this.opts.attach
-              .request("hydra-acp/cancel_prompt", {
-                sessionId,
-                messageId: peer.messageId,
-              })
-              .catch(() => undefined);
-            return;
-          }
+        if (await this.cancelPeerQueuedByPromptTs(session, ts)) {
+          return;
         }
-        // `_processing …_` indicator cancel: same wire call as the
-        // spinner branch below. session/cancel is turn-scoped so the
-        // daemon doesn't care which indicator the user reacted on; we
-        // accept either as a stop gesture for the running turn. This
-        // closes the asymmetry where the queued indicator was a valid
-        // `:stop_sign:` target but its `_processing …_` successor was
-        // not — the user had to chase the spinner instead.
         if (session.processingTs === ts) {
           log.info(`cancel <- slack (processing) ${sessionId.slice(0, 8)}`);
-          this.opts.attach.notify("session/cancel", { sessionId });
+          this.cancelRunningTurn(session);
           return;
         }
-        // Spinner cancel: send session/cancel for the running turn.
-        // The agent's response (stopReason "cancelled") flows through
-        // turn_complete (or our await on session/prompt for own
-        // turns) and finalizes the spinner with a "cancelled" marker.
         if (session.spinnerTs !== ts) {
           return;
         }
         log.info(`cancel <- slack ${sessionId.slice(0, 8)}`);
-        this.opts.attach.notify("session/cancel", { sessionId });
+        this.cancelRunningTurn(session);
         return;
       }
       case "hide":
@@ -3037,9 +3245,12 @@ function renderSpinner(session: SessionState): string {
   const elapsed = session.spinnerStartedAt
     ? Date.now() - session.spinnerStartedAt
     : 0;
-  const suffix =
-    elapsed >= 30_000 ? ` (${formatElapsed(elapsed)})` : "";
-  const head = `:hourglass_flowing_sand: _working...${suffix}_`;
+  // Elapsed-time meta only appears after 30s — keeps the head clean
+  // on short turns, surfaces proof-of-life on long ones. Italic so it
+  // visually matches the _N ahead_ / _N waiting_ meta on the queued
+  // and processing indicators.
+  const meta = elapsed >= 30_000 ? ` · _${formatElapsed(elapsed)}_` : "";
+  const head = `:robot_face: *Working*${meta}`;
   if (!session.spinnerExpanded) {
     return head;
   }
@@ -3096,16 +3307,36 @@ function formatPromptPreview(text: string): string {
   return `${trimmed.slice(0, 200)}…`;
 }
 
-// Render the "· N ahead" tail that follows the `_queued` italic prefix
-// in the queued-indicator string. Centralized so the new-prompt post
-// (postQueueIndicator) and the edit-time refresh (handlePromptQueueUpdated)
-// stay in sync. Empty string when nothing was ahead at enqueue time —
-// the suffix is omitted entirely rather than rendering "· 0 ahead".
-function formatAheadSuffix(aheadCount: number): string {
-  if (aheadCount <= 0) {
-    return "";
-  }
-  return ` · ${aheadCount === 1 ? "1 ahead" : `${aheadCount} ahead`}`;
+// Centralized renderers for the per-turn indicator family. Keep the
+// vocabulary consistent across the queued → processing → working →
+// ready lifecycle so the thread reads as one continuous progression:
+//
+//   :hourglass_flowing_sand: *Queued*    — <preview> · _N ahead_
+//   :zap:                    *Processing* — <preview> · _N waiting_
+//   :robot_face:             *Working*   · _elapsed_
+//   :x:                      _Cancelled_  — <preview>
+//   :white_check_mark:       *Ready*      · _N tools · elapsed_
+//
+// Bold for active states, italic for terminal/de-emphasized states.
+// Em-dash separates the label from the prompt preview; middle-dot
+// separates meta segments. Meta segments stay italic so they don't
+// compete with the preview text for scanning.
+function formatQueuedIndicator(text: string, aheadCount: number): string {
+  const meta = aheadCount > 0
+    ? ` · _${aheadCount === 1 ? "1 ahead" : `${aheadCount} ahead`}_`
+    : "";
+  return `:hourglass_flowing_sand: *Queued* — ${formatPromptPreview(text)}${meta}`;
+}
+
+function formatProcessingIndicator(text: string, waitingCount: number): string {
+  const meta = waitingCount > 0
+    ? ` · _${waitingCount === 1 ? "1 waiting" : `${waitingCount} waiting`}_`
+    : "";
+  return `:zap: *Processing* — ${formatPromptPreview(text)}${meta}`;
+}
+
+function formatCancelledQueuedIndicator(text: string): string {
+  return `:x: _Cancelled_ — ${formatPromptPreview(text)}`;
 }
 
 // Compact human-readable elapsed-time formatter.
@@ -3320,4 +3551,188 @@ function pickResolvedVerb(
     default:
       return `chose ${opt.name}`;
   }
+}
+
+// Block Kit cancel buttons attached to the queued / processing / spinner
+// indicators. Two action ids — queued cancels target a specific entry
+// (correlated by the indicator's own Slack ts, which lives on the
+// QueuedPromptEntry / peer entry); turn cancels are session-scoped and
+// fire session/cancel for the running turn. The spinner-details button
+// shares the turn-scoped value shape since it also only needs sessionId.
+export const CANCEL_QUEUED_ACTION_ID = "hydra-cancel-queued";
+export const CANCEL_TURN_ACTION_ID = "hydra-cancel-turn";
+export const SPINNER_DETAILS_ACTION_ID = "hydra-spinner-details";
+
+interface CancelQueuedButtonValue {
+  s: string; // sessionId
+  p: string; // promptTs of the indicator message (used as the correlator)
+}
+
+interface CancelTurnButtonValue {
+  s: string; // sessionId
+}
+
+export function encodeCancelQueuedValue(v: CancelQueuedButtonValue): string {
+  return JSON.stringify(v);
+}
+
+export function decodeCancelQueuedValue(
+  raw: string | undefined,
+): CancelQueuedButtonValue | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const v = JSON.parse(raw) as Partial<CancelQueuedButtonValue>;
+    if (typeof v.s !== "string" || typeof v.p !== "string") {
+      return undefined;
+    }
+    return { s: v.s, p: v.p };
+  } catch {
+    return undefined;
+  }
+}
+
+export function encodeCancelTurnValue(v: CancelTurnButtonValue): string {
+  return JSON.stringify(v);
+}
+
+export function decodeCancelTurnValue(
+  raw: string | undefined,
+): CancelTurnButtonValue | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const v = JSON.parse(raw) as Partial<CancelTurnButtonValue>;
+    if (typeof v.s !== "string") {
+      return undefined;
+    }
+    return { s: v.s };
+  } catch {
+    return undefined;
+  }
+}
+
+// Build a danger-styled "Cancel" button referencing a specific queued
+// indicator's ts. Used as the sole element of the actions block on
+// queued indicators (own + peer).
+function buildCancelQueuedButton(
+  sessionId: string,
+  promptTs: string,
+): import("../formatters/markdown.js").ButtonElement {
+  return {
+    type: "button",
+    text: { type: "plain_text", text: "Cancel", emoji: true },
+    action_id: CANCEL_QUEUED_ACTION_ID,
+    value: encodeCancelQueuedValue({ s: sessionId, p: promptTs }),
+    style: "danger",
+  };
+}
+
+// Build a danger-styled "Cancel" button for turn-scoped cancels
+// (processing indicator + spinner). Same wire effect as a :stop_sign:
+// reaction on either of those messages.
+function buildCancelTurnButton(
+  sessionId: string,
+): import("../formatters/markdown.js").ButtonElement {
+  return {
+    type: "button",
+    text: { type: "plain_text", text: "Cancel", emoji: true },
+    action_id: CANCEL_TURN_ACTION_ID,
+    value: encodeCancelTurnValue({ s: sessionId }),
+    style: "danger",
+  };
+}
+
+// Build the spinner's details toggle button. Label flips based on
+// current expanded state — same boolean the :eyes: reaction toggles.
+// Caller decides whether to include it (see buildSpinnerBlocks: only
+// shown once a tool call has appeared, or while the spinner is
+// already expanded so the user can collapse back).
+function buildSpinnerDetailsButton(
+  sessionId: string,
+  expanded: boolean,
+): import("../formatters/markdown.js").ButtonElement {
+  return {
+    type: "button",
+    text: {
+      type: "plain_text",
+      text: expanded ? "Hide details" : "Show details",
+      emoji: true,
+    },
+    action_id: SPINNER_DETAILS_ACTION_ID,
+    value: encodeCancelTurnValue({ s: sessionId }),
+  };
+}
+
+// Block payload for a queued indicator. Section block carries the
+// existing mrkdwn line; actions block holds a single Cancel button
+// correlated by the indicator's own Slack ts. The caller already knows
+// the ts before posting (postQueueIndicator) or has it on the entry
+// (handlePromptQueueUpdated re-render). Returns `undefined` blocks when
+// promptTs is not yet known so the indicator posts as plain text first
+// and gets blocks attached on the follow-up update.
+export function buildQueuedBlocks(
+  sessionId: string,
+  promptTs: string,
+  text: string,
+): SlackBlock[] {
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text },
+    },
+    {
+      type: "actions",
+      elements: [buildCancelQueuedButton(sessionId, promptTs)],
+    },
+  ];
+}
+
+// Block payload for the processing indicator. Single Cancel button
+// firing session/cancel — same wire effect as the :stop_sign: reaction
+// branch in handleReaction.
+export function buildProcessingBlocks(
+  sessionId: string,
+  text: string,
+): SlackBlock[] {
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text },
+    },
+    {
+      type: "actions",
+      elements: [buildCancelTurnButton(sessionId)],
+    },
+  ];
+}
+
+// Block payload for the per-turn spinner. Always includes a Cancel
+// button; conditionally includes a Show/Hide details toggle when there
+// is something to expand (or the spinner is already expanded — so the
+// user can always collapse back). The absent toggle on a tool-call-less
+// turn doubles as a "no tools yet" signal.
+export function buildSpinnerBlocks(
+  sessionId: string,
+  text: string,
+  opts: { expanded: boolean; toolCallCount: number },
+): SlackBlock[] {
+  const showToggle = opts.expanded || opts.toolCallCount > 0;
+  const elements: import("../formatters/markdown.js").ButtonElement[] = [];
+  if (showToggle) {
+    elements.push(buildSpinnerDetailsButton(sessionId, opts.expanded));
+  }
+  elements.push(buildCancelTurnButton(sessionId));
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text },
+    },
+    {
+      type: "actions",
+      elements,
+    },
+  ];
 }

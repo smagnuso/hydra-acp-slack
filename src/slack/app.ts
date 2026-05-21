@@ -1,8 +1,13 @@
 import bolt from "@slack/bolt";
 import type { Config } from "../config.js";
 import {
+  CANCEL_QUEUED_ACTION_ID,
+  CANCEL_TURN_ACTION_ID,
+  decodeCancelQueuedValue,
+  decodeCancelTurnValue,
   decodePermissionButtonValue,
   PERMISSION_ACTION_PREFIX,
+  SPINNER_DETAILS_ACTION_ID,
 } from "../acp/session.js";
 import { logger } from "../util/log.js";
 import {
@@ -393,6 +398,129 @@ export function createSlackApp(config: Config): SlackApp {
         }
       } catch (err) {
         log.warn(`permission button failed: ${(err as Error).message}`);
+      }
+    },
+  );
+
+  // Block Kit Cancel button on a queued indicator (own or peer). The
+  // button value carries {sessionId, promptTs}; promptTs is the ts of
+  // the indicator the user clicked on, which the bridge uses to find
+  // the right queued entry (own vs. peer) and fire
+  // hydra-acp/cancel_prompt. Equivalent to the :stop_sign: reaction
+  // on the same indicator.
+  app.action(
+    { type: "block_actions", action_id: CANCEL_QUEUED_ACTION_ID },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string; action_id?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        log.info(`cancel-queued button drop: unauthorized user ${userId ?? "(none)"}`);
+        return;
+      }
+      const decoded = decodeCancelQueuedValue(ba.value);
+      if (!decoded) {
+        log.warn(
+          `cancel-queued button drop: undecodable value action_id=${ba.action_id ?? "?"}`,
+        );
+        return;
+      }
+      const entry = threadRegistry.findBySession(decoded.s);
+      if (!entry) {
+        log.info(
+          `cancel-queued button drop: no bridge for session=${decoded.s.slice(0, 8)}`,
+        );
+        return;
+      }
+      log.info(
+        `cancel-queued button user=${userId ?? "?"} session=${decoded.s.slice(0, 8)} promptTs=${decoded.p}`,
+      );
+      try {
+        const ok = await entry.bridge.cancelQueuedByPromptTs(
+          decoded.s,
+          decoded.p,
+        );
+        if (!ok) {
+          log.info(
+            `cancel-queued button: no matching entry for promptTs=${decoded.p} (already started/cancelled?)`,
+          );
+        }
+      } catch (err) {
+        log.warn(`cancel-queued button failed: ${(err as Error).message}`);
+      }
+    },
+  );
+
+  // Block Kit Cancel button on the processing indicator or the spinner.
+  // Turn-scoped: fires session/cancel for the running turn. Same effect
+  // as the :stop_sign: reaction on either message.
+  app.action(
+    { type: "block_actions", action_id: CANCEL_TURN_ACTION_ID },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string; action_id?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        log.info(`cancel-turn button drop: unauthorized user ${userId ?? "(none)"}`);
+        return;
+      }
+      const decoded = decodeCancelTurnValue(ba.value);
+      if (!decoded) {
+        log.warn(
+          `cancel-turn button drop: undecodable value action_id=${ba.action_id ?? "?"}`,
+        );
+        return;
+      }
+      const entry = threadRegistry.findBySession(decoded.s);
+      if (!entry) {
+        log.info(
+          `cancel-turn button drop: no bridge for session=${decoded.s.slice(0, 8)}`,
+        );
+        return;
+      }
+      log.info(
+        `cancel-turn button user=${userId ?? "?"} session=${decoded.s.slice(0, 8)}`,
+      );
+      try {
+        entry.bridge.cancelTurn(decoded.s);
+      } catch (err) {
+        log.warn(`cancel-turn button failed: ${(err as Error).message}`);
+      }
+    },
+  );
+
+  // Spinner "Show details / Hide details" toggle. Flips
+  // session.spinnerExpanded — same boolean the :eyes: reaction
+  // toggles — and re-renders the spinner so the button label and
+  // (optional) tool-list body invert.
+  app.action(
+    { type: "block_actions", action_id: SPINNER_DETAILS_ACTION_ID },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string; action_id?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        log.info(`spinner-details button drop: unauthorized user ${userId ?? "(none)"}`);
+        return;
+      }
+      const decoded = decodeCancelTurnValue(ba.value);
+      if (!decoded) {
+        log.warn(
+          `spinner-details button drop: undecodable value action_id=${ba.action_id ?? "?"}`,
+        );
+        return;
+      }
+      const entry = threadRegistry.findBySession(decoded.s);
+      if (!entry) {
+        log.info(
+          `spinner-details button drop: no bridge for session=${decoded.s.slice(0, 8)}`,
+        );
+        return;
+      }
+      try {
+        await entry.bridge.toggleSpinnerDetails(decoded.s);
+      } catch (err) {
+        log.warn(`spinner-details button failed: ${(err as Error).message}`);
       }
     },
   );
