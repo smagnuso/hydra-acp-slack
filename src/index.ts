@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AcpAttach } from "./acp/attach.js";
 import { SessionBridge } from "./acp/session.js";
 import {
@@ -25,7 +28,25 @@ interface AttachContext {
   bridge: SessionBridge;
 }
 
+function readVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(
+      readFileSync(resolve(here, "../package.json"), "utf8"),
+    ) as { version?: string };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes("--version") || argv.includes("-v")) {
+    process.stdout.write(`hydra-acp-slack ${readVersion()}\n`);
+    return;
+  }
+
   const path = configPath();
   const config = loadConfig(path);
   setDebug(config.debug);
