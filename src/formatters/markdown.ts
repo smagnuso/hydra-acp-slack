@@ -24,7 +24,41 @@ export interface MarkdownBlock {
   type: "markdown";
   text: string;
 }
-export type SlackBlock = MarkdownBlock;
+
+// Subset of Block Kit blocks we emit beyond `markdown`. Only the fields
+// we actually set are modeled; Slack ignores unknown fields and Bolt's
+// full type tree is too noisy to mirror here. See:
+//   https://docs.slack.dev/reference/block-kit/blocks/section-block
+//   https://docs.slack.dev/reference/block-kit/blocks/actions-block
+//   https://docs.slack.dev/reference/block-kit/block-elements/button-element
+export interface SectionBlock {
+  type: "section";
+  text: { type: "mrkdwn" | "plain_text"; text: string };
+  block_id?: string;
+}
+export interface ButtonElement {
+  type: "button";
+  text: { type: "plain_text"; text: string; emoji?: boolean };
+  action_id: string;
+  value?: string;
+  style?: "primary" | "danger";
+}
+export interface ActionsBlock {
+  type: "actions";
+  elements: ButtonElement[];
+  block_id?: string;
+}
+export interface ContextBlock {
+  type: "context";
+  elements: Array<{ type: "mrkdwn" | "plain_text"; text: string }>;
+  block_id?: string;
+}
+
+export type SlackBlock =
+  | MarkdownBlock
+  | SectionBlock
+  | ActionsBlock
+  | ContextBlock;
 
 const FENCE_INFO_RE = /```([^\s`]+)[ \t]*\n/;
 
@@ -48,10 +82,16 @@ export function buildHighlightBlocks(raw: string): SlackBlock[] | null {
 
 // `markdown` blocks share a cumulative 12000-char budget per payload.
 // Returns false when the block array would exceed it — caller should
-// fall back to the text-field / mrkdwn split path.
+// fall back to the text-field / mrkdwn split path. Only markdown
+// blocks count against the budget; other block types (sections,
+// actions, etc.) have their own per-block limits and aren't part of
+// this aggregate.
 export function fitsBlockLimits(blocks: SlackBlock[]): boolean {
   let total = 0;
   for (const b of blocks) {
+    if (b.type !== "markdown") {
+      continue;
+    }
     total += b.text.length;
     if (total > 12000) {
       return false;

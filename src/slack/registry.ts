@@ -96,6 +96,19 @@ class ThreadRegistry {
     return this.byThread.get(this.key(channel, threadTs))?.[0];
   }
 
+  // Locate the entry for `sessionId` across all threads. Used by the
+  // block-action handler, which only has a sessionId encoded in the
+  // button value and needs the owning bridge.
+  findBySession(sessionId: string): ThreadEntry | undefined {
+    for (const list of this.byThread.values()) {
+      const found = list.find((e) => e.sessionId === sessionId);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  }
+
   // All candidate bridges for a thread, in priority order. Inbound
   // message routing iterates this and falls back on send error.
   lookupAll(channel: string, threadTs: string): ThreadEntry[] {

@@ -361,6 +361,13 @@ export class SessionBridge {
       // after the delay-await returns and skips posting if a sibling
       // resolved during the delay window.
       resolved: boolean;
+      // When the user resolved via a Block Kit button, the click
+      // handler already overwrote the prompt with a "decided by @user"
+      // line via chat.update. Setting this flag tells
+      // resolvePermissionEntry to leave the message alone instead of
+      // deleting it. Sibling-resolved and ensureSession-failed paths
+      // leave this false so the prompt still gets cleaned up.
+      suppressDelete?: boolean;
     }
   >();
   // When backfillHistory is true, we surface every replayed event. When
@@ -895,17 +902,14 @@ export class SessionBridge {
     entry.promptChannel = session.channel;
 
     const title = (toolCall.title as string | undefined) ?? "Permission requested";
-    const optionLines = options
-      .map(
-        (o) =>
-          `   • \`${o.optionId}\`  ${o.name}` + (o.kind ? `  _(${o.kind})_` : ""),
-      )
-      .join("\n");
-    const text =
-      `:lock: *Permission requested*\n${title}\n${optionLines}\n` +
-      `_react :white_check_mark: to allow once, :unlock: to allow always, :x: to reject_`;
+    const { text, blocks } = buildPermissionMessage(
+      sessionId,
+      toolCallId,
+      title,
+      options,
+    );
 
-    const promptTs = await this.postOrAccumulate(session, text);
+    const promptTs = await this.postOrAccumulate(session, text, blocks);
 
     if (this.permissionResolvers.get(key) === entry) {
       // Still pending — fill in the ts so reactions and resolution
@@ -944,7 +948,7 @@ export class SessionBridge {
       // return without posting; the wake fn also clears the timer.
       entry.wakeDelay();
     }
-    if (entry.promptTs && entry.promptChannel) {
+    if (entry.promptTs && entry.promptChannel && !entry.suppressDelete) {
       await this.opts.thread.deleteMessage(
         entry.promptChannel,
         entry.promptTs,
@@ -1986,6 +1990,7 @@ export class SessionBridge {
   private async postOrAccumulate(
     session: SessionState,
     text: string,
+    blocks?: SlackBlock[],
   ): Promise<string | undefined> {
     await this.flushUserMessage(session);
     await this.flushAgentMessage(session);
@@ -2000,6 +2005,7 @@ export class SessionBridge {
       channel: session.channel,
       threadTs: session.threadTs,
       text,
+      ...(blocks ? { blocks } : {}),
     });
     return r.ts;
   }
@@ -2431,6 +2437,43 @@ export class SessionBridge {
     // reacted, the agent has its answer; leaving the lock prompt around
     // would clutter the thread and tempt accidental re-reactions.
     await this.resolvePermissionEntry(entry);
+  }
+
+  // Block-action handler entry point. The action handler in slack/app.ts
+  // looks up the bridge by sessionId (encoded in the button value) and
+  // calls this with the toolCallId + selected optionId. resolution is
+  // the same as the reaction path — we just bypass the (channel, ts)
+  // lookup since the button carried the correlator directly.
+  //
+  // `decoratedBy` is the Slack user id of the clicker, used to annotate
+  // the resolved prompt ("Allowed by <@U…>") via chat.update before the
+  // entry is cleaned up.
+  async respondToPermissionByToolCallId(
+    toolCallId: string,
+    optionId: string | "cancel",
+    decoratedBy: string | undefined,
+  ): Promise<boolean> {
+    const entry = this.permissionResolvers.get(toolCallId);
+    if (!entry) {
+      return false;
+    }
+    if (decoratedBy && entry.promptTs && entry.promptChannel) {
+      // Replace the buttons with a static "resolved" line so the thread
+      // keeps an audit trail of who decided. Done before resolvePermissionEntry
+      // (which would otherwise delete the message) — we want this update to
+      // win.
+      entry.suppressDelete = true;
+      const verb =
+        optionId === "cancel"
+          ? "cancelled"
+          : pickResolvedVerb(entry.options, optionId);
+      const newText = `:lock: _${verb} by <@${decoratedBy}>_`;
+      await this.opts.thread
+        .updateMessage(entry.promptChannel, entry.promptTs, newText, [])
+        .catch(() => undefined);
+    }
+    await this.respondToPermission(entry, optionId);
+    return true;
   }
 
   async handleReaction(
@@ -3127,3 +3170,154 @@ function statusIconShim(s: string | undefined): string {
 }
 // Keep the unused-import linter quiet but available for future use.
 void statusIconShim;
+
+// Action-id prefix for permission buttons. The slack/app.ts action
+// listener matches on this exact prefix; the rest of the action_id is
+// the optionId (which can be opaque per ACP — we surface it back to
+// the agent verbatim, but never embed the sessionId / toolCallId in
+// it because Slack caps action_id at 255 chars).
+export const PERMISSION_ACTION_PREFIX = "hydra-perm:";
+
+// `value` is the only place we get to stash extra state on a Slack
+// button (max 2000 chars). We pack sessionId + toolCallId + optionId
+// as JSON so the action handler can route without a global lookup
+// table.
+interface PermissionButtonValue {
+  s: string; // sessionId
+  t: string; // toolCallId
+  o: string; // optionId (or "cancel")
+}
+
+export function encodePermissionButtonValue(v: PermissionButtonValue): string {
+  return JSON.stringify(v);
+}
+
+export function decodePermissionButtonValue(
+  raw: string | undefined,
+): PermissionButtonValue | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const v = JSON.parse(raw) as Partial<PermissionButtonValue>;
+    if (typeof v.s !== "string" || typeof v.t !== "string" || typeof v.o !== "string") {
+      return undefined;
+    }
+    return { s: v.s, t: v.t, o: v.o };
+  } catch {
+    return undefined;
+  }
+}
+
+// Construct the text fallback + Block Kit payload for a permission
+// prompt. `text` is what notifications and accessibility readers see;
+// the visible UI is the section header + actions row of buttons.
+// Slack's actions block holds at most 5 elements — if the agent
+// surfaces more options than that we fall through to a sixth
+// "overflow" disclosure inline in the section. In practice agents
+// emit ≤4 options (allow_once / allow_always / reject_once /
+// reject_always).
+export function buildPermissionMessage(
+  sessionId: string,
+  toolCallId: string,
+  title: string,
+  options: ReadonlyArray<{ optionId: string; name: string; kind?: string }>,
+): { text: string; blocks: SlackBlock[] } {
+  const text = `:lock: Permission requested — ${title}`;
+  const blocks: SlackBlock[] = [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `:lock: *Permission requested*\n${title}` },
+    },
+  ];
+
+  const buttonOptions = options.slice(0, 5);
+  const overflow = options.slice(5);
+
+  if (overflow.length > 0) {
+    // Surface the names of the cut-off options in a context block so
+    // the user at least knows they exist — but they won't be clickable
+    // without a redesign (e.g. an overflow menu). Worth revisiting if
+    // any agent actually starts emitting >5 options.
+    const overflowLine =
+      "_additional options not shown:_ " +
+      overflow.map((o) => `\`${o.name}\``).join(", ");
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: overflowLine }],
+    });
+  }
+
+  const elements = buttonOptions.map((o) => {
+    const label = truncateButtonLabel(o.name);
+    const style = buttonStyleForKind(o.kind);
+    const value = encodePermissionButtonValue({
+      s: sessionId,
+      t: toolCallId,
+      o: o.optionId,
+    });
+    const btn: import("../formatters/markdown.js").ButtonElement = {
+      type: "button",
+      text: { type: "plain_text", text: label, emoji: true },
+      action_id: `${PERMISSION_ACTION_PREFIX}${o.optionId}`,
+      value,
+    };
+    if (style) {
+      btn.style = style;
+    }
+    return btn;
+  });
+
+  if (elements.length > 0) {
+    blocks.push({ type: "actions", elements });
+  }
+
+  return { text, blocks };
+}
+
+// Slack caps button text at 75 chars. Trim with an ellipsis so long
+// option names don't get a hard reject from the chat.postMessage
+// validator.
+function truncateButtonLabel(name: string): string {
+  const MAX = 75;
+  if (name.length <= MAX) {
+    return name;
+  }
+  return name.slice(0, MAX - 1) + "…";
+}
+
+function buttonStyleForKind(kind: string | undefined): "primary" | "danger" | undefined {
+  if (kind === "allow_once" || kind === "allow_always") {
+    return "primary";
+  }
+  if (kind === "reject_once" || kind === "reject_always") {
+    return "danger";
+  }
+  return undefined;
+}
+
+// Human-readable verb for the "decided by @user" line shown after a
+// button click. Derived from the resolved option's kind when available,
+// falling back to the option name; "cancel" is its own case (no option
+// in `options`).
+function pickResolvedVerb(
+  options: ReadonlyArray<{ optionId: string; name: string; kind?: string }>,
+  optionId: string,
+): string {
+  const opt = options.find((o) => o.optionId === optionId);
+  if (!opt) {
+    return "decided";
+  }
+  switch (opt.kind) {
+    case "allow_once":
+      return "allowed once";
+    case "allow_always":
+      return "allowed always";
+    case "reject_once":
+      return "rejected";
+    case "reject_always":
+      return "rejected always";
+    default:
+      return `chose ${opt.name}`;
+  }
+}

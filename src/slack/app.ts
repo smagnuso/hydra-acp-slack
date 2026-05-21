@@ -1,5 +1,9 @@
 import bolt from "@slack/bolt";
 import type { Config } from "../config.js";
+import {
+  decodePermissionButtonValue,
+  PERMISSION_ACTION_PREFIX,
+} from "../acp/session.js";
 import { logger } from "../util/log.js";
 import {
   listAgents,
@@ -343,6 +347,55 @@ export function createSlackApp(config: Config): SlackApp {
       log.warn(`reaction(${e.reaction}) remove failed: ${(err as Error).message}`);
     }
   });
+
+  // Block Kit button click on a permission prompt. action_id starts
+  // with PERMISSION_ACTION_PREFIX; the button value carries the
+  // sessionId + toolCallId + optionId triple (encoded in
+  // encodePermissionButtonValue) so we can route without a global
+  // bridge index.
+  app.action(
+    { type: "block_actions", action_id: new RegExp(`^${PERMISSION_ACTION_PREFIX}`) },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string; action_id?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        log.info(`permission button drop: unauthorized user ${userId ?? "(none)"}`);
+        return;
+      }
+      const decoded = decodePermissionButtonValue(ba.value);
+      if (!decoded) {
+        log.warn(
+          `permission button drop: undecodable value action_id=${ba.action_id ?? "?"}`,
+        );
+        return;
+      }
+      const entry = threadRegistry.findBySession(decoded.s);
+      if (!entry) {
+        log.info(
+          `permission button drop: no bridge for session=${decoded.s.slice(0, 8)} toolCallId=${decoded.t}`,
+        );
+        return;
+      }
+      log.info(
+        `permission button click user=${userId ?? "?"} session=${decoded.s.slice(0, 8)} toolCallId=${decoded.t} optionId=${decoded.o}`,
+      );
+      try {
+        const ok = await entry.bridge.respondToPermissionByToolCallId(
+          decoded.t,
+          decoded.o,
+          userId,
+        );
+        if (!ok) {
+          log.info(
+            `permission button: no pending resolver for toolCallId=${decoded.t} (already resolved?)`,
+          );
+        }
+      } catch (err) {
+        log.warn(`permission button failed: ${(err as Error).message}`);
+      }
+    },
+  );
 
   let watchdogTimer: NodeJS.Timeout | undefined;
   let lastConnectedAt = 0;
