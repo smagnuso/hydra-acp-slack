@@ -2390,13 +2390,23 @@ export class SessionBridge {
       }
       return;
     }
-    const finalizeTail = (async () => {
+    // Chain on notificationChain so any session/update events still
+    // draining for this turn (the agent_message_chunks that arrived in
+    // the same WS batch as the session/prompt response) complete BEFORE
+    // we flush + finalize. Without this the awaiter resumes ahead of
+    // the trailing chunks: flushAgentMessage sees an empty buffer,
+    // finalizeSpinner deletes the original spinner and posts Ready, and
+    // when the trailing chunks finally run their ensureSpinner posts a
+    // fresh Working (with a now-meaningless Cancel button) before the
+    // periodic flusher gets around to posting the agent text.
+    const tail = this.notificationChain.then(async () => {
       await this.flushAgentMessage(session);
       this.closeAgentMessage(session);
       await this.finalizeSpinner(session, stopReason);
-    })();
+    });
+    this.notificationChain = tail;
     try {
-      await finalizeTail;
+      await tail;
     } finally {
       // Resolve our barrier so any waiter (e.g. the next-turn's
       // prompt_queue_removed{started} handler) can proceed. Done in
