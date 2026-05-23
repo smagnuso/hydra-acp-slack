@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
@@ -41,7 +41,8 @@ export interface Config {
   debug: boolean;
 }
 
-const DEFAULT_CONF_PATH = resolve(homedir(), ".hydra-acp-slack.conf");
+const PRIMARY_CONF_PATH = resolve(homedir(), ".hydra-acp", "slack.conf");
+const LEGACY_CONF_PATH = resolve(homedir(), ".hydra-acp-slack.conf");
 
 // The bridge owns a single state directory at ~/.hydra-acp-slack/ for
 // every persistent artifact it writes: the cwd → channel routing map,
@@ -128,7 +129,7 @@ function stringSet(map: Map<string, string>, key: string): Set<string> {
   );
 }
 
-export function loadConfig(path: string = DEFAULT_CONF_PATH): Config {
+export function loadConfig(path: string = configPath()): Config {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
@@ -186,5 +187,15 @@ export function loadConfig(path: string = DEFAULT_CONF_PATH): Config {
 }
 
 export function configPath(): string {
-  return process.env.HYDRA_ACP_SLACK_CONF ?? DEFAULT_CONF_PATH;
+  const override = process.env.HYDRA_ACP_SLACK_CONF;
+  if (override) {
+    return override;
+  }
+  if (existsSync(PRIMARY_CONF_PATH)) {
+    return PRIMARY_CONF_PATH;
+  }
+  if (existsSync(LEGACY_CONF_PATH)) {
+    return LEGACY_CONF_PATH;
+  }
+  return PRIMARY_CONF_PATH;
 }

@@ -85,7 +85,7 @@ manifest, the manual flow is:
 
 ### 2. Write the config file
 
-Place credentials at `~/.hydra-acp-slack.conf`. This is a plain
+Place credentials at `~/.hydra-acp/slack.conf`. This is a plain
 `KEY=VALUE` file — quotes optional, comments with `#`. The bridge
 reads it on startup; tokens never live in env vars or shell history.
 
@@ -103,7 +103,7 @@ Lock it down — these tokens give full read/write access to whichever
 channels the bot is in, so treat them like API keys:
 
 ```sh
-chmod 600 ~/.hydra-acp-slack.conf
+chmod 600 ~/.hydra-acp/slack.conf
 ```
 
 `AUTHORIZED_USERS` is the allowlist of Slack user IDs whose messages
@@ -213,7 +213,7 @@ with `hydra-acp extensions start|stop|restart hydra-acp-slack` and
 
 ### 6. Run standalone (alternative)
 
-Set `HYDRA_DAEMON_URL` and `HYDRA_TOKEN` in `~/.hydra-acp-slack.conf`
+Set `HYDRA_DAEMON_URL` and `HYDRA_TOKEN` in `~/.hydra-acp/slack.conf`
 (or export them as env vars), then:
 
 ```sh
