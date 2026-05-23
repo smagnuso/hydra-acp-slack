@@ -136,6 +136,13 @@ interface ToolCallState {
   bodyChunks: string[];
 }
 
+export interface ExitPlanMessageState {
+  toolCallId: string;
+  messageTs: string | undefined;
+  plan: string;
+  status: string | undefined;
+}
+
 interface SessionState {
   sessionId: string;
   threadTs: string | undefined;
@@ -246,6 +253,12 @@ interface SessionState {
   // in place rather than posting a fresh message per delta. Cleared
   // at turn end alongside the spinner.
   planTs: string | undefined;
+  // toolCallId → state for Claude's ExitPlanMode messages. The
+  // ExitPlanMode tool carries the plan markdown in rawInput.plan; we
+  // render it as its own thread message and chat.update on later
+  // tool_call_updates so the status footer flips when the user
+  // approves / rejects. Cleared at turn end alongside the spinner.
+  exitPlanMessages: Map<string, ExitPlanMessageState>;
   // Barrier resolved once the current own-turn's Ready marker has
   // posted. Set synchronously in sendUserPrompt before we await
   // session/prompt — so it exists before the daemon's
@@ -747,6 +760,10 @@ export class SessionBridge {
       }
       case "tool_call":
       case "tool_call_update": {
+        if (isExitPlanModeUpdate(update, session)) {
+          await this.handleExitPlanModeUpdate(session, update);
+          break;
+        }
         await this.handleToolCallUpdate(session, update);
         break;
       }
@@ -999,6 +1016,65 @@ export class SessionBridge {
       `permission resolved-by-tool-call toolCallId=${toolCallId} status=${status}`,
     );
     await this.resolvePermissionEntry(entry).catch(() => undefined);
+  }
+
+  private async handleExitPlanModeUpdate(
+    session: SessionState,
+    update: Record<string, unknown>,
+  ): Promise<void> {
+    const toolCallId = (update.toolCallId ?? "") as string;
+    if (!toolCallId) return;
+    const existing = session.exitPlanMessages.get(toolCallId);
+    const plan = readExitPlanMarkdown(update);
+    const status =
+      typeof update.status === "string" ? update.status : undefined;
+    if (!existing && plan === null) {
+      // Named ExitPlanMode but no body yet — fall back to the generic
+      // tool-call handling so the user sees *something*. Same fallback
+      // shape as the CLI and browser.
+      await this.handleToolCallUpdate(session, update);
+      return;
+    }
+    const state: ExitPlanMessageState = existing ?? {
+      toolCallId,
+      messageTs: undefined,
+      plan: plan ?? "",
+      status,
+    };
+    if (plan !== null) state.plan = plan;
+    if (status !== undefined) state.status = status;
+    session.exitPlanMessages.set(toolCallId, state);
+    if (status !== undefined) {
+      await this.maybeResolvePermissionByToolCall(toolCallId, status);
+    }
+    // Flush surrounding agent stream so the Plan message lands at the
+    // right point in thread order — mirrors upsertPlan's treatment.
+    await this.flushUserMessage(session);
+    await this.flushAgentMessage(session);
+    this.closeAgentMessage(session);
+    if (!session.threadTs) {
+      log.warn(
+        `handleExitPlanModeUpdate with no threadTs for ${session.sessionId}; dropping`,
+      );
+      return;
+    }
+    const rendered = renderExitPlanMessage(state);
+    if (state.messageTs) {
+      await this.opts.thread.updateMessage(
+        session.channel,
+        state.messageTs,
+        rendered.text,
+        rendered.blocks,
+      );
+      return;
+    }
+    const r = await this.opts.thread.postMessage({
+      channel: session.channel,
+      threadTs: session.threadTs,
+      text: rendered.text,
+      ...(rendered.blocks ? { blocks: rendered.blocks } : {}),
+    });
+    state.messageTs = r.ts;
   }
 
   private async handleToolCallUpdate(
@@ -1263,6 +1339,7 @@ export class SessionBridge {
     session.turnToolCallIds = [];
     session.spinnerStartedAt = undefined;
     session.planTs = undefined;
+    session.exitPlanMessages.clear();
     session.processingTs = undefined;
     // Delete the in-progress spinner (where it originally posted, mid-turn)
     // and post a fresh "Ready" marker at the bottom of the thread. One
@@ -1430,6 +1507,7 @@ export class SessionBridge {
       spinnerStartedAt: undefined,
       spinnerTicker: undefined,
       planTs: undefined,
+      exitPlanMessages: new Map(),
       pendingOwnTurnEnd: undefined,
       hadActivity: false,
       availableCommands: this.pendingCommands.get(sessionId) ?? new Map(),
@@ -3065,6 +3143,88 @@ export class SessionBridge {
 function isAvailableCommandsUpdate(params: Record<string, unknown>): boolean {
   const update = (params.update ?? {}) as { sessionUpdate?: unknown };
   return update.sessionUpdate === "available_commands_update";
+}
+
+// Recognise Claude's ExitPlanMode tool across casing variants. The wire
+// emits camelCase ("ExitPlanMode") today; snake_case ("exit_plan_mode") is
+// accepted for forward-compat.
+export function isExitPlanModeTool(name: string | undefined): boolean {
+  if (!name) return false;
+  return name.toLowerCase().replace(/[_\s-]/g, "") === "exitplanmode";
+}
+
+// True when a session/update tool_call(_update) refers to an ExitPlanMode
+// tool. For updates without a `name` field, we still route through the
+// dedicated handler when the toolCallId has already been claimed by an
+// earlier ExitPlanMode message — that's how status-only updates flow.
+function isExitPlanModeUpdate(
+  update: Record<string, unknown>,
+  session: SessionState,
+): boolean {
+  const name = (update.name ?? update.title) as string | undefined;
+  if (isExitPlanModeTool(name)) {
+    return true;
+  }
+  const toolCallId = (update.toolCallId ?? "") as string;
+  return toolCallId.length > 0 && session.exitPlanMessages.has(toolCallId);
+}
+
+function readExitPlanMarkdown(update: Record<string, unknown>): string | null {
+  const rawInput = update.rawInput;
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+    return null;
+  }
+  const plan = (rawInput as Record<string, unknown>).plan;
+  if (typeof plan !== "string" || plan.length === 0) return null;
+  return plan;
+}
+
+export function renderExitPlanMessage(state: ExitPlanMessageState): {
+  text: string;
+  blocks?: SlackBlock[];
+} {
+  const header = ":clipboard: *Plan*";
+  const body = toSlackMrkdwn(state.plan);
+  const footer = exitPlanFooterText(state.status);
+  const text = footer ? `${header}\n${body}\n\n${footer}` : `${header}\n${body}`;
+  const blocks = buildHighlightBlocks(state.plan);
+  if (blocks && fitsBlockLimits(blocks)) {
+    const decorated: SlackBlock[] = [
+      { type: "section", text: { type: "mrkdwn", text: header } },
+      ...blocks,
+    ];
+    if (footer) {
+      decorated.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: footer }],
+      });
+    }
+    return { text, blocks: decorated };
+  }
+  return { text };
+}
+
+function exitPlanFooterText(status: string | undefined): string | undefined {
+  if (status === undefined) return undefined;
+  switch (status) {
+    case "completed":
+    case "succeeded":
+    case "ok":
+      return ":white_check_mark: Approved";
+    case "failed":
+    case "error":
+    case "rejected":
+      return ":x: Rejected";
+    case "cancelled":
+      return ":no_entry_sign: Cancelled";
+    case "pending":
+    case "in_progress":
+    case "running":
+    case "updated":
+      return "_awaiting approval…_";
+    default:
+      return undefined;
+  }
 }
 
 // Split an advertised command name into the verb portion and any
