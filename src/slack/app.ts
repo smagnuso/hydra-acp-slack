@@ -558,15 +558,27 @@ export function createSlackApp(config: Config): SlackApp {
       lastConnectedAt = Date.now();
       smConnected = true;
       // Bolt holds the SocketModeClient on its receiver; tap into its
-      // connect/disconnect events so we can detect a wedged reconnect
-      // loop. When bolt's WebClient gets stuck (e.g. node's DNS or
-      // keep-alive pool turned bad mid-VPN-flap), bolt fires
-      // 'disconnected' and never recovers; we exit so hydra restarts
-      // us with a fresh process.
+      // lifecycle events so we can detect a wedged reconnect loop.
+      // When bolt's WebClient gets stuck (e.g. node's DNS or keep-alive
+      // pool turned bad mid-VPN-flap), bolt sits in 'reconnecting'
+      // forever; we exit so hydra restarts us with a fresh process.
+      //
+      // The relevant events are 'reconnecting' and 'connected'.
+      // 'disconnected' is NOT what fires on a network drop — bolt only
+      // emits that on graceful shutdown (disconnect() call). The
+      // underlying ws 'close' triggers delayReconnectAttempt which
+      // emits 'reconnecting' on every retry. So we treat 'reconnecting'
+      // as the down signal and 'connected' as the up signal.
       receiver.client.on("connected", () => {
         smConnected = true;
         lastConnectedAt = Date.now();
         log.info("slack socket-mode reconnected");
+      });
+      receiver.client.on("reconnecting", () => {
+        if (smConnected) {
+          log.warn("slack socket-mode reconnecting");
+        }
+        smConnected = false;
       });
       receiver.client.on("disconnected", () => {
         smConnected = false;
