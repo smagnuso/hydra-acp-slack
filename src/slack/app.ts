@@ -19,6 +19,7 @@ import {
   createSession,
 } from "./commands.js";
 import { reactionAction } from "./reaction-map.js";
+import { transcribeAudio } from "../transcribe.js";
 import { threadRegistry } from "./registry.js";
 import {
   attemptResurrect,
@@ -148,15 +149,17 @@ export function createSlackApp(config: Config): SlackApp {
       return;
     }
     const candidates = threadRegistry.lookupAll(m.channel, m.thread_ts);
-    const text = (m.text ?? "").trim();
+    let text = (m.text ?? "").trim();
     if (!text && !(m.files && m.files.length > 0)) {
       return;
     }
-    // Download any attached images and forward as multimodal content.
-    const imageBlocks: Array<{ type: "image"; mimeType: string; data: string }> =
+    // Download any attached images/audio and forward as multimodal content.
+    const imageBlocks: Array<{ type: "image" | "audio"; mimeType: string; data: string }> =
       [];
     for (const f of m.files ?? []) {
-      if (!f.mimetype || !f.mimetype.startsWith("image/")) {
+      const isImage = f.mimetype?.startsWith("image/");
+      const isAudio = f.mimetype?.startsWith("audio/");
+      if (!isImage && !isAudio) {
         continue;
       }
       const url = f.url_private_download ?? f.url_private;
@@ -164,10 +167,30 @@ export function createSlackApp(config: Config): SlackApp {
         continue;
       }
       try {
-        const data = await downloadAsBase64(url, config.slackBotToken);
-        imageBlocks.push({ type: "image", mimeType: f.mimetype, data });
+        const data = await downloadAsBase64(url, config.slackBotToken, f.mimetype ?? "");
+        imageBlocks.push({ type: isImage ? "image" : "audio", mimeType: f.mimetype!, data });
       } catch (err) {
-        log.warn(`image download failed: ${(err as Error).message}`);
+        log.warn(`file download failed (${f.mimetype}): ${(err as Error).message}`);
+      }
+    }
+    // Transcribe any audio attachments and fold the transcript into the
+    // prompt text. The agent silently strips audio content blocks it can't
+    // forward (Claude doesn't support audio natively), so without a text
+    // transcript the prompt would arrive empty and the API would reject it.
+    for (const block of imageBlocks) {
+      if (block.type !== "audio") continue;
+      try {
+        const transcript = await transcribeAudio(
+          Buffer.from(block.data, "base64"),
+          block.mimeType,
+        );
+        if (transcript) {
+          text = text ? `${text}\n[Voice: ${transcript}]` : transcript;
+          log.info(`transcribed audio: ${transcript.slice(0, 80)}`);
+        }
+      } catch (err) {
+        log.warn(`transcription failed: ${(err as Error).message}`);
+        if (!text) text = "[Voice message — transcription unavailable]";
       }
     }
     if (candidates.length === 0) {
@@ -662,14 +685,20 @@ export function createSlackApp(config: Config): SlackApp {
 }
 
 
-async function downloadAsBase64(url: string, botToken: string): Promise<string> {
+async function downloadAsBase64(url: string, botToken: string, expectedMime: string): Promise<string> {
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${botToken}` },
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
+  const contentType = res.headers.get("content-type") ?? "";
+  const expectedPrefix = expectedMime.split("/")[0] + "/";
+  if (!contentType.startsWith("image/") && !contentType.startsWith("audio/")) {
+    throw new Error(`unexpected content-type ${contentType} (auth failure?)`);
+  }
   const buf = Buffer.from(await res.arrayBuffer());
+  log.info(`file downloaded mime=${contentType.split(";")[0]} expected=${expectedPrefix} sizeB=${buf.length}`);
   return buf.toString("base64");
 }
 

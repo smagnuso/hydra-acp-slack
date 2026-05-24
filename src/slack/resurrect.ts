@@ -12,7 +12,7 @@ const SESSION_MARKER_RE = /_session ([0-9A-Za-z_-]+)_/;
 
 export interface PendingMessage {
   text: string;
-  images: ReadonlyArray<{ type: "image"; mimeType: string; data: string }>;
+  images: ReadonlyArray<{ type: "image" | "audio"; mimeType: string; data: string }>;
 }
 
 // Messages waiting for their session's bridge to come up. Filled by

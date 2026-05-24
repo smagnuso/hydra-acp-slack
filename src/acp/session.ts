@@ -86,7 +86,7 @@ interface QueuedPromptEntry {
   // Captured at enqueue time. We need these to rebuild the prompt
   // blocks on update_prompt — Slack edits only update text, so any
   // images attached to the original message must be re-sent unchanged.
-  imageBlocks: ReadonlyArray<{ type: "image"; mimeType: string; data: string }>;
+  imageBlocks: ReadonlyArray<{ type: "image" | "audio"; mimeType: string; data: string }>;
   // Captured at enqueue time so handlePromptQueueUpdated can re-render
   // the indicator with the same "· N ahead" suffix the original post
   // showed. Without this, edits silently drop the suffix and the user
@@ -2276,7 +2276,7 @@ export class SessionBridge {
   async sendUserPrompt(
     sessionId: string,
     text: string,
-    images: ReadonlyArray<{ type: "image"; mimeType: string; data: string }> = [],
+    images: ReadonlyArray<{ type: "image" | "audio"; mimeType: string; data: string }> = [],
     sourceSlackTs?: string,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -2364,7 +2364,7 @@ export class SessionBridge {
       prompt.push({ type: "text", text });
     }
     for (const img of images) {
-      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
+      prompt.push({ type: img.type, mimeType: img.mimeType, data: img.data });
     }
 
     // Turn-end barrier — must exist before we send session/prompt so
@@ -2543,7 +2543,7 @@ export class SessionBridge {
       prompt.push({ type: "text", text: newText });
     }
     for (const img of entry.imageBlocks) {
-      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
+      prompt.push({ type: img.type, mimeType: img.mimeType, data: img.data });
     }
     void this.opts.attach
       .request("hydra-acp/update_prompt", {
@@ -2749,7 +2749,7 @@ export class SessionBridge {
       (q) => q.promptTs === promptTs && !q.started && !q.cancelled,
     );
     let text: string;
-    let images: ReadonlyArray<{ type: "image"; mimeType: string; data: string }> = [];
+    let images: ReadonlyArray<{ type: "image" | "audio"; mimeType: string; data: string }> = [];
     let queuedMessageId: string | undefined;
     if (owned) {
       text = owned.text;
@@ -2786,7 +2786,7 @@ export class SessionBridge {
       prompt.push({ type: "text", text });
     }
     for (const img of images) {
-      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
+      prompt.push({ type: img.type, mimeType: img.mimeType, data: img.data });
     }
     let amended = false;
     try {
