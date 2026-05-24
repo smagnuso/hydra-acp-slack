@@ -74,7 +74,7 @@ If you'd rather build the app from scratch instead of using the
 manifest, the manual flow is:
 
 - Bot scopes: `commands`, `channels:history`, `channels:read`,
-  `chat:write`, `files:write`, `groups:history`, `groups:read`,
+  `chat:write`, `files:read`, `files:write`, `groups:history`, `groups:read`,
   `groups:write`, `im:history`, `reactions:read`.
 - Enable **Socket Mode** in the Settings tab.
 - Subscribe to bot events: `message.channels`, `message.groups`,
