@@ -209,7 +209,7 @@ vars set: `HYDRA_ACP_DAEMON_URL`, `HYDRA_ACP_TOKEN`, `HYDRA_ACP_WS_URL`.
 hydra-acp-slack uses them to discover and attach to sessions. Stdout/stderr
 land in `~/.hydra-acp/extensions/hydra-acp-slack.log`. Lifecycle is managed
 with `hydra-acp extensions start|stop|restart hydra-acp-slack` and
-`hydra-acp extensions logs hydra-acp-slack -f` to tail.
+`hydra-acp extensions log hydra-acp-slack -f` to tail.
 
 ### 6. Run standalone (alternative)
 
