@@ -23,7 +23,7 @@ REST API for active sessions, and attaches over WSS to each one.
        hydra WSS      <----> |             |
        /acp                  +-------------+
                                     |
-                            ~/.hydra-acp-slack/
+                            ~/.hydra-acp/slack/
                               hidden/     (hidden originals)
                               truncated/  (full output cache)
                               channels.json  (cwd → channel map)
@@ -121,12 +121,12 @@ your profile in Slack → **More** → **Copy member ID**.
 
 ### 3. State directory
 
-The bridge owns one directory on disk: `~/.hydra-acp-slack/`. It's
+The bridge owns one directory on disk: `~/.hydra-acp/slack/`. It's
 created lazily as the bridge runs; you don't need to set it up by
 hand. Layout:
 
 ```
-~/.hydra-acp-slack/
+~/.hydra-acp/slack/
 ├── channels.json   # optional: { "<absolute cwd>": "<channelId>", ... }
 ├── hidden/         # full text of 🙈-hidden messages (so they can be restored)
 └── truncated/      # full tool output cached for 📖 expand
@@ -229,7 +229,7 @@ it accepts.
 |-----------------------------|------------------------------------|-------|
 | `SLACK_BOT_TOKEN`           | (required)                         | Bot User OAuth Token from Slack, `xoxb-...`. |
 | `SLACK_APP_TOKEN`           | (required)                         | App-Level Token from Slack, `xapp-...`, with `connections:write`. |
-| `SLACK_CHANNEL_ID`          | none                               | Default channel ID (`C…`/`G…`). Used when the session's cwd has no entry in `~/.hydra-acp-slack/channels.json` (or the session has no cwd). |
+| `SLACK_CHANNEL_ID`          | none                               | Default channel ID (`C…`/`G…`). Used when the session's cwd has no entry in `~/.hydra-acp/slack/channels.json` (or the session has no cwd). |
 | `AUTHORIZED_USERS`          | empty                              | Comma-separated Slack user IDs (`U…`) allowed to prompt the agent. **Empty = anyone in the bot's channels can prompt** — see security note below. Bot reactions (allow/deny/cancel) are gated the same way. |
 | `UPLOAD_BUNDLE_ON_END`      | `true`                             | When the hydra session closes, attach the daemon-built `*.hydra` bundle (meta + history JSON) to the Slack thread — re-importable into any hydra via `hydra-acp sessions import` or the browser UI. Set to `false` to disable. |
 | `WEBSOCKET_STALE_THRESHOLD` | `30`                               | Seconds of continuously-disconnected Slack Socket Mode WS before the bridge `process.exit(1)`s. Hydra's extension manager respawns it ~1s later with a fresh DNS cache + HTTP client; the existing process gets stuck in a reconnect loop after a network flap (VPN drop, etc.). |
@@ -284,7 +284,7 @@ Examples:
 !session -- what time is it?              # all defaults + first prompt
 ```
 
-The bot reacts ✅ on the command message and replies with the resolved agent/cwd. The new thread appears in whichever channel the resolved cwd maps to in `~/.hydra-acp-slack/channels.json` — falling back to `SLACK_CHANNEL_ID` when no mapping is found — which may differ from where `!session` was posted.
+The bot reacts ✅ on the command message and replies with the resolved agent/cwd. The new thread appears in whichever channel the resolved cwd maps to in `~/.hydra-acp/slack/channels.json` — falling back to `SLACK_CHANNEL_ID` when no mapping is found — which may differ from where `!session` was posted.
 
 ## Tests
 

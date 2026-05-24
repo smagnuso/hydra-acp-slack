@@ -1432,7 +1432,7 @@ export class SessionBridge {
     if (!channel) {
       log.warn(
         `no Slack channel resolved for sessionId=${sessionId} cwd=${cwd ?? "?"}; ` +
-          `set SLACK_CHANNEL_ID or add a cwd → channelId entry to ~/.hydra-acp-slack/channels.json`,
+          `set SLACK_CHANNEL_ID or add a cwd → channelId entry to ~/.hydra-acp/slack/channels.json`,
       );
       return undefined;
     }

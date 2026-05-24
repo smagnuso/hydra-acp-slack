@@ -44,12 +44,12 @@ export interface Config {
 const PRIMARY_CONF_PATH = resolve(homedir(), ".hydra-acp", "slack.conf");
 const LEGACY_CONF_PATH = resolve(homedir(), ".hydra-acp-slack.conf");
 
-// The bridge owns a single state directory at ~/.hydra-acp-slack/ for
+// The bridge owns a single state directory at ~/.hydra-acp/slack/ for
 // every persistent artifact it writes: the cwd → channel routing map,
 // hidden-message originals, and truncated-output cache. We keep the
 // paths fixed (rather than configurable) so users don't have to think
 // about file locations and so the structure stays predictable.
-const STATE_DIR = resolve(homedir(), ".hydra-acp-slack");
+const STATE_DIR = resolve(homedir(), ".hydra-acp", "slack");
 
 export function channelsFile(): string {
   return resolve(STATE_DIR, "channels.json");
