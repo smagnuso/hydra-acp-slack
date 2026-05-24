@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
+  AMEND_QUEUED_ACTION_ID,
   buildProcessingBlocks,
   buildQueuedBlocks,
   buildSpinnerBlocks,
@@ -16,7 +17,7 @@ import {
 const SESSION = "session-abc";
 const PROMPT_TS = "1700000000.000100";
 
-test("buildQueuedBlocks emits a section + actions row with a Cancel button keyed by promptTs", () => {
+test("buildQueuedBlocks emits a section + actions row with Amend + Cancel buttons keyed by promptTs", () => {
   const blocks = buildQueuedBlocks(
     SESSION,
     PROMPT_TS,
@@ -26,15 +27,23 @@ test("buildQueuedBlocks emits a section + actions row with a Cancel button keyed
   assert.equal(blocks[0]?.type, "section");
   assert.equal(blocks[1]?.type, "actions");
   const actions = blocks[1] as { elements: Array<Record<string, unknown>> };
-  assert.equal(actions.elements.length, 1);
-  const btn = actions.elements[0]!;
-  assert.equal(btn.type, "button");
-  assert.equal(btn.action_id, CANCEL_QUEUED_ACTION_ID);
-  assert.equal(btn.style, "danger");
-  const v = decodeCancelQueuedValue(btn.value as string);
-  assert.ok(v);
-  assert.equal(v?.s, SESSION);
-  assert.equal(v?.p, PROMPT_TS);
+  assert.equal(actions.elements.length, 2);
+  const amend = actions.elements[0]!;
+  assert.equal(amend.type, "button");
+  assert.equal(amend.action_id, AMEND_QUEUED_ACTION_ID);
+  assert.equal(amend.style, undefined);
+  const amendVal = decodeCancelQueuedValue(amend.value as string);
+  assert.ok(amendVal);
+  assert.equal(amendVal?.s, SESSION);
+  assert.equal(amendVal?.p, PROMPT_TS);
+  const cancel = actions.elements[1]!;
+  assert.equal(cancel.type, "button");
+  assert.equal(cancel.action_id, CANCEL_QUEUED_ACTION_ID);
+  assert.equal(cancel.style, "danger");
+  const cancelVal = decodeCancelQueuedValue(cancel.value as string);
+  assert.ok(cancelVal);
+  assert.equal(cancelVal?.s, SESSION);
+  assert.equal(cancelVal?.p, PROMPT_TS);
 });
 
 test("buildProcessingBlocks emits a single turn-scoped Cancel button", () => {

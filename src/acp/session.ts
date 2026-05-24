@@ -204,6 +204,25 @@ interface SessionState {
   // the spinner. Singleton per session — one prompt runs at a time.
   // Cleared in finalizeSpinnerWork at turn end.
   processingTs: string | undefined;
+  // messageId of the in-flight head turn (the prompt the agent is
+  // currently running). Captured from prompt_queue_removed{started},
+  // which fires for own + peer entries equally and is the only
+  // signal the originator receives. Used as targetMessageId for the
+  // Amend button on queued indicators. Cleared on turn_complete.
+  currentHeadMessageId: string | undefined;
+  // Guard against double-finalize. When an own-originated turn is
+  // amended, both the turn_complete notification (included because
+  // wasAmend=true) and the session/prompt response tail both call
+  // finalizeSpinner. The first wins; the second is skipped.
+  // Reset at the start of each own sendUserPrompt.
+  turnFinalizedOnce: boolean;
+  // messageIds of cancelled turns that were actually amendments.
+  // Populated by hydra-acp/prompt_amended (sent to all clients, no
+  // exclusion). Checked in the sendUserPrompt response path so own
+  // amended turns render as "amended" rather than "cancelled" (the
+  // turn_complete notification is excluded for own-originated entries,
+  // so _meta can't be read there).
+  recentlyAmendedIds: Set<string>;
   // Streaming user message from another frontend attached to the same
   // session (e.g. the editor's stdio shim). Same flush model as agent.
   userChunks: string[];
@@ -554,35 +573,51 @@ export class SessionBridge {
       this.applyAvailableCommandsUpdate(earlySessionId, params);
     }
 
-    if (!this.live) {
-      return; // drop replayed history; only act on live events
-    }
     const sessionId = (params.sessionId ?? params.session_id) as
       | string
       | undefined;
-    log.debug(`notification ${n.method} sessionId=${sessionId ?? "(none)"}`);
 
-    if (n.method === "session/update" && sessionId) {
-      await this.handleSessionUpdate(sessionId, params);
-      return;
-    }
-
-    // Server-driven queue notifications. Hydra emits these for any
-    // session/prompt arrival; we use them to bind a server messageId
-    // to a locally-tracked QueuedPromptEntry (so reactions on our
-    // queue indicator can fire hydra-acp/cancel_prompt for cross-
-    // client cancellation), and to mirror cross-client edits /
-    // cancels back into the Slack indicator.
+    // Queue lifecycle notifications are always live — the daemon never
+    // replays them in history. Process them regardless of this.live so
+    // that turns which start during the live-quiet window still get
+    // their currentHeadMessageId set (avoids "amend skip (no head)"
+    // when the bridge re-attaches to a session and misses the started
+    // event for the first buffered prompt).
     if (n.method === "hydra-acp/prompt_queue_added" && sessionId) {
+      log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueAdded(sessionId, params);
       return;
     }
     if (n.method === "hydra-acp/prompt_queue_updated" && sessionId) {
+      log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueUpdated(sessionId, params);
       return;
     }
     if (n.method === "hydra-acp/prompt_queue_removed" && sessionId) {
+      log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueRemoved(sessionId, params);
+      return;
+    }
+    if (n.method === "hydra-acp/prompt_amended" && sessionId) {
+      log.debug(`notification ${n.method} sessionId=${sessionId}`);
+      const cancelledMessageId =
+        typeof params.cancelledMessageId === "string"
+          ? params.cancelledMessageId
+          : undefined;
+      if (cancelledMessageId) {
+        const session = this.sessions.get(sessionId);
+        session?.recentlyAmendedIds.add(cancelledMessageId);
+      }
+      return;
+    }
+
+    if (!this.live) {
+      return; // drop replayed history; only act on live events
+    }
+    log.debug(`notification ${n.method} sessionId=${sessionId ?? "(none)"}`);
+
+    if (n.method === "session/update" && sessionId) {
+      await this.handleSessionUpdate(sessionId, params);
       return;
     }
 
@@ -749,13 +784,23 @@ export class SessionBridge {
         // the per-turn spinner into a static marker. The stopReason
         // carries through to the marker so a user-cancelled turn reads
         // as "cancelled" rather than the success default.
-        const stopReason = update.stopReason as string | undefined;
+        let stopReason = update.stopReason as string | undefined;
+        // Detect amended turns: daemon attaches _meta["hydra-acp"].amended
+        // when wasAmend=true so the cancelled turn renders as "amended"
+        // rather than an error-red "cancelled". Mirror the TUI's soft
+        // "amended · Xs" styling.
+        const meta = update._meta as Record<string, unknown> | undefined;
+        const hydraMeta = meta?.["hydra-acp"] as Record<string, unknown> | undefined;
+        if (hydraMeta?.amended && stopReason === "cancelled") {
+          stopReason = "amended";
+        }
         log.info(
           `turn_complete ${sessionId.slice(0, 8)}${stopReason ? ` (${stopReason})` : ""}`,
         );
         await this.flushAgentMessage(session);
         this.closeAgentMessage(session);
         await this.finalizeSpinner(session, stopReason);
+        session.currentHeadMessageId = undefined;
         break;
       }
       case "tool_call":
@@ -1325,6 +1370,13 @@ export class SessionBridge {
     session: SessionState,
     stopReason?: string,
   ): Promise<void> {
+    // When an own-originated turn is amended, turn_complete (notification,
+    // included because wasAmend=true) and the sendUserPrompt response tail
+    // both call finalizeSpinner. Let the first one win and skip the rest.
+    if (session.turnFinalizedOnce) {
+      return;
+    }
+    session.turnFinalizedOnce = true;
     const ts = session.spinnerTs;
     const processingTs = session.processingTs;
     const expanded = session.spinnerExpanded;
@@ -1491,6 +1543,9 @@ export class SessionBridge {
       peerQueueByMessageId: new Map(),
       sourceTsToEntry: new Map(),
       processingTs: undefined,
+      currentHeadMessageId: undefined,
+      turnFinalizedOnce: false,
+      recentlyAmendedIds: new Set(),
       userChunks: [],
       title: undefined,
       cwd,
@@ -1792,6 +1847,12 @@ export class SessionBridge {
       typeof params.messageId === "string" ? params.messageId : undefined;
     if (!messageId) return;
     const reason = typeof params.reason === "string" ? params.reason : "";
+    // Universal head-tracking: reason="started" names the new in-flight
+    // head for own + peer entries equally. Captured here so the Amend
+    // button on subsequent queued indicators knows the target.
+    if (reason === "started") {
+      session.currentHeadMessageId = messageId;
+    }
     const ownEntry = session.queueByMessageId.get(messageId);
     if (ownEntry) {
       if (reason === "cancelled" || reason === "abandoned") {
@@ -1899,7 +1960,14 @@ export class SessionBridge {
         typeof e.messageId === "string" ? e.messageId : undefined;
       if (!messageId) continue;
       const position = typeof e.position === "number" ? e.position : 0;
-      if (position === 0) continue;
+      if (position === 0) {
+        // Head turn started before we attached — the live started
+        // notification already fired, so this is the only place we
+        // learn its messageId. Needed as targetMessageId for the
+        // Amend button.
+        session.currentHeadMessageId = messageId;
+        continue;
+      }
       const originator = (e.originator ?? {}) as Record<string, unknown>;
       // If somehow it's our own entry (shouldn't happen on a fresh
       // attach — our prior clientId is gone), skip; the local-chain
@@ -2332,6 +2400,8 @@ export class SessionBridge {
       : ownBarrier;
     session.pendingOwnTurnEnd = myBarrier;
 
+    // Reset so the double-finalize guard doesn't carry over from a prior turn.
+    session.turnFinalizedOnce = false;
     let stopReason: string | undefined;
     try {
       const response = await this.opts.attach.request<{
@@ -2399,10 +2469,27 @@ export class SessionBridge {
     // when the trailing chunks finally run their ensureSpinner posts a
     // fresh Working (with a now-meaningless Cancel button) before the
     // periodic flusher gets around to posting the agent text.
+    //
+    // hydra-acp/prompt_amended arrives as a separate WS message after
+    // the session/prompt response even though the daemon sends them in
+    // order — separate I/O events mean the response's microtask runs
+    // before the notification's I/O event fires. By the time the tail
+    // runs (after notificationChain drains), prompt_amended has been
+    // processed and recentlyAmendedIds is populated. Check here so an
+    // amended own turn renders as "amended" rather than "cancelled".
     const tail = this.notificationChain.then(async () => {
+      let effectiveStopReason = stopReason;
+      if (
+        effectiveStopReason === "cancelled" &&
+        queuedEntry.messageId &&
+        session.recentlyAmendedIds.has(queuedEntry.messageId)
+      ) {
+        session.recentlyAmendedIds.delete(queuedEntry.messageId);
+        effectiveStopReason = "amended";
+      }
       await this.flushAgentMessage(session);
       this.closeAgentMessage(session);
-      await this.finalizeSpinner(session, stopReason);
+      await this.finalizeSpinner(session, effectiveStopReason);
     });
     this.notificationChain = tail;
     try {
@@ -2650,6 +2737,123 @@ export class SessionBridge {
       return true;
     }
     return this.cancelPeerQueuedByPromptTs(session, promptTs);
+  }
+
+  // Public entry point for the Block Kit "Amend" button on a queued
+  // indicator. Locates the queued entry (own or peer) by its
+  // indicator's Slack ts, fires hydra-acp/amend_prompt with the
+  // current in-flight head as the target, then cancels the queued
+  // entry so it doesn't also run. Returns true when an entry matched.
+  async amendQueuedByPromptTs(
+    sessionId: string,
+    promptTs: string,
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return false;
+    }
+    const headMessageId = session.currentHeadMessageId;
+    // Resolve the queued entry — own first, peer second — and capture
+    // the text + (own-only) image blocks + messageId for the cancel
+    // follow-up.
+    const owned = session.queuedPrompts.find(
+      (q) => q.promptTs === promptTs && !q.started && !q.cancelled,
+    );
+    let text: string;
+    let images: ReadonlyArray<{ type: "image"; mimeType: string; data: string }> = [];
+    let queuedMessageId: string | undefined;
+    if (owned) {
+      text = owned.text;
+      images = owned.imageBlocks;
+      queuedMessageId = owned.messageId;
+    } else {
+      let peerMatch: PeerQueueIndicator | undefined;
+      for (const [, peer] of session.peerQueueByMessageId) {
+        if (peer.promptTs === promptTs) {
+          peerMatch = peer;
+          break;
+        }
+      }
+      if (!peerMatch) {
+        return false;
+      }
+      text = peerMatch.text;
+      queuedMessageId = peerMatch.messageId;
+    }
+    if (!headMessageId) {
+      // No turn in flight — nothing to amend onto. Leave the entry
+      // intact so it runs normally; surface the no-op in the indicator
+      // so the click isn't silently dropped.
+      log.info(
+        `amend skip (no head) ${sessionId.slice(0, 8)} promptTs=${promptTs}`,
+      );
+      return false;
+    }
+    log.info(
+      `amend <- slack ${sessionId.slice(0, 8)} head=${headMessageId.slice(0, 8)} from=${queuedMessageId?.slice(0, 8) ?? "?"}: ${text.slice(0, 80)}`,
+    );
+    const prompt: Array<Record<string, unknown>> = [];
+    if (text) {
+      prompt.push({ type: "text", text });
+    }
+    for (const img of images) {
+      prompt.push({ type: "image", mimeType: img.mimeType, data: img.data });
+    }
+    let amended = false;
+    try {
+      const result = await this.opts.attach.request<{
+        amended?: boolean;
+        reason?: string;
+      }>("hydra-acp/amend_prompt", {
+        sessionId,
+        targetMessageId: headMessageId,
+        prompt,
+      });
+      amended = result?.amended === true;
+      if (!amended) {
+        log.warn(
+          `amend rejected ${sessionId.slice(0, 8)} reason=${result?.reason ?? "?"}`,
+        );
+      }
+    } catch (err) {
+      log.warn(
+        `amend_prompt failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+      );
+      return false;
+    }
+    if (!amended) {
+      return false;
+    }
+    // Amend succeeded — drop the queued entry. cancel_prompt also
+    // triggers prompt_queue_removed{cancelled} so peers see it leave
+    // the queue; we pre-update the indicator here so the visual flips
+    // to "amended" rather than "cancelled".
+    if (queuedMessageId) {
+      void this.opts.attach
+        .request("hydra-acp/cancel_prompt", {
+          sessionId,
+          messageId: queuedMessageId,
+        })
+        .catch((err: unknown) => {
+          log.warn(
+            `post-amend cancel_prompt failed: ${(err as Error).message}`,
+          );
+        });
+      if (owned) {
+        owned.cancelled = true;
+        session.queueByMessageId.delete(queuedMessageId);
+      } else {
+        session.peerQueueByMessageId.delete(queuedMessageId);
+      }
+    }
+    await this.opts.thread
+      .updateMessage(
+        session.channel,
+        promptTs,
+        formatAmendedQueuedIndicator(text),
+      )
+      .catch(() => undefined);
+    return true;
   }
 
   // Public entry point for the Block Kit "Cancel" button on the
@@ -3298,7 +3502,12 @@ function renderParent(opts: {
     opts.title ?? (opts.cwd ? basename(opts.cwd) : undefined);
   const lines: string[] = [];
   if (heading) {
-    lines.push(`:robot_face: *${heading}*`);
+    // Model in the bold heading line so it shows up in Slack's thread
+    // previews (sidebar / channel listing / link unfurls), where only
+    // the first line is visible. Re-rendered on current_model_update.
+    const short = shortenModel(opts.modelId);
+    const suffix = short ? ` \`${short}\`` : "";
+    lines.push(`:robot_face: *${heading}*${suffix}`);
   }
   const tailParts: string[] = [];
   if (opts.cwd) {
@@ -3307,9 +3516,6 @@ function renderParent(opts: {
     tailParts.push(`on \`${daemonHost}\``);
   }
   const agent = friendlyAgent(opts.agentName);
-  // Collapse "agent · model" into "agent(model)" so the line reads like
-  // "opencode(gpt-5-codex) · mode build · …" rather than three separate
-  // backticked pills competing for the same row.
   const agentCell = agentWithModel(agent, opts.modelId);
   if (agentCell) {
     tailParts.push(`\`${agentCell}\``);
@@ -3363,7 +3569,7 @@ function agentWithModel(
     return undefined;
   }
   const short = shortenModel(model);
-  return short ? `${agent}(${short})` : agent;
+  return short ? `${agent} · ${short}` : agent;
 }
 
 // Pull the hydra agentId from an update's _meta extension namespace.
@@ -3444,7 +3650,10 @@ function renderReadyMarker(
 ): string {
   let icon: string;
   let label: string;
-  if (stopReason === "cancelled") {
+  if (stopReason === "amended") {
+    icon = ":twisted_rightwards_arrows:";
+    label = "amended";
+  } else if (stopReason === "cancelled") {
     icon = ":no_entry:";
     label = "cancelled";
   } else if (stopReason && stopReason !== "end_turn") {
@@ -3507,6 +3716,10 @@ function formatProcessingIndicator(text: string, waitingCount: number): string {
 
 function formatCancelledQueuedIndicator(text: string): string {
   return `:x: _Cancelled_ — ${formatPromptPreview(text)}`;
+}
+
+function formatAmendedQueuedIndicator(text: string): string {
+  return `:twisted_rightwards_arrows: _Amended into running turn_ — ${formatPromptPreview(text)}`;
 }
 
 // Compact human-readable elapsed-time formatter.
@@ -3730,6 +3943,7 @@ function pickResolvedVerb(
 // fire session/cancel for the running turn. The spinner-details button
 // shares the turn-scoped value shape since it also only needs sessionId.
 export const CANCEL_QUEUED_ACTION_ID = "hydra-cancel-queued";
+export const AMEND_QUEUED_ACTION_ID = "hydra-amend-queued";
 export const CANCEL_TURN_ACTION_ID = "hydra-cancel-turn";
 export const SPINNER_DETAILS_ACTION_ID = "hydra-spinner-details";
 
@@ -3800,6 +4014,22 @@ function buildCancelQueuedButton(
   };
 }
 
+// Build the "Amend" button paired with Cancel on a queued indicator.
+// Click flow: cancel this queued entry, fold its text into the
+// in-flight head turn via hydra-acp/amend_prompt. Same {s, p} payload
+// as Cancel — the action_id discriminates server-side.
+function buildAmendQueuedButton(
+  sessionId: string,
+  promptTs: string,
+): import("../formatters/markdown.js").ButtonElement {
+  return {
+    type: "button",
+    text: { type: "plain_text", text: "Amend", emoji: true },
+    action_id: AMEND_QUEUED_ACTION_ID,
+    value: encodeCancelQueuedValue({ s: sessionId, p: promptTs }),
+  };
+}
+
 // Build a danger-styled "Cancel" button for turn-scoped cancels
 // (processing indicator + spinner). Same wire effect as a :stop_sign:
 // reaction on either of those messages.
@@ -3855,7 +4085,10 @@ export function buildQueuedBlocks(
     },
     {
       type: "actions",
-      elements: [buildCancelQueuedButton(sessionId, promptTs)],
+      elements: [
+        buildAmendQueuedButton(sessionId, promptTs),
+        buildCancelQueuedButton(sessionId, promptTs),
+      ],
     },
   ];
 }

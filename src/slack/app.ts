@@ -1,6 +1,7 @@
 import bolt from "@slack/bolt";
 import type { Config } from "../config.js";
 import {
+  AMEND_QUEUED_ACTION_ID,
   CANCEL_QUEUED_ACTION_ID,
   CANCEL_TURN_ACTION_ID,
   decodeCancelQueuedValue,
@@ -447,6 +448,53 @@ export function createSlackApp(config: Config): SlackApp {
         }
       } catch (err) {
         log.warn(`cancel-queued button failed: ${(err as Error).message}`);
+      }
+    },
+  );
+
+  // Block Kit Amend button on a queued indicator. Same {sessionId,
+  // promptTs} payload as Cancel; the bridge folds the queued text into
+  // the in-flight head turn via hydra-acp/amend_prompt and then drops
+  // the queued entry.
+  app.action(
+    { type: "block_actions", action_id: AMEND_QUEUED_ACTION_ID },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string; action_id?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        log.info(`amend-queued button drop: unauthorized user ${userId ?? "(none)"}`);
+        return;
+      }
+      const decoded = decodeCancelQueuedValue(ba.value);
+      if (!decoded) {
+        log.warn(
+          `amend-queued button drop: undecodable value action_id=${ba.action_id ?? "?"}`,
+        );
+        return;
+      }
+      const entry = threadRegistry.findBySession(decoded.s);
+      if (!entry) {
+        log.info(
+          `amend-queued button drop: no bridge for session=${decoded.s.slice(0, 8)}`,
+        );
+        return;
+      }
+      log.info(
+        `amend-queued button user=${userId ?? "?"} session=${decoded.s.slice(0, 8)} promptTs=${decoded.p}`,
+      );
+      try {
+        const ok = await entry.bridge.amendQueuedByPromptTs(
+          decoded.s,
+          decoded.p,
+        );
+        if (!ok) {
+          log.info(
+            `amend-queued button: no matching entry / no head for promptTs=${decoded.p}`,
+          );
+        }
+      } catch (err) {
+        log.warn(`amend-queued button failed: ${(err as Error).message}`);
       }
     },
   );
