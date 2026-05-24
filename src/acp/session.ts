@@ -1,6 +1,7 @@
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import type { Config } from "../config.js";
+import { synthesizeText } from "../synthesize.js";
 import {
   buildHighlightBlocks,
   fitsBlockLimits,
@@ -210,6 +211,12 @@ interface SessionState {
   // signal the originator receives. Used as targetMessageId for the
   // Amend button on queued indicators. Cleared on turn_complete.
   currentHeadMessageId: string | undefined;
+  // When the triggering prompt was transcribed from voice, synthesize the
+  // agent's response as audio and upload it to the thread.
+  voiceSynthPending: boolean;
+  // Accumulates all agent text for the current turn when voiceSynthPending.
+  // Populated by closeAgentMessage; cleared at turn end after synthesis.
+  voiceTurnText: string;
   // messageIds of cancelled turns that were actually amendments.
   // Populated by hydra-acp/prompt_amended (sent to all clients, no
   // exclusion). Checked in the sendUserPrompt response path so own
@@ -794,6 +801,7 @@ export class SessionBridge {
         await this.flushAgentMessage(session);
         this.closeAgentMessage(session);
         await this.finalizeSpinner(session, stopReason);
+        this.maybeSynthesizeVoiceResponse(session);
         session.currentHeadMessageId = undefined;
         break;
       }
@@ -1535,6 +1543,8 @@ export class SessionBridge {
       sourceTsToEntry: new Map(),
       processingTs: undefined,
       currentHeadMessageId: undefined,
+      voiceSynthPending: false,
+      voiceTurnText: "",
       recentlyAmendedIds: new Set(),
       userChunks: [],
       title: undefined,
@@ -2134,6 +2144,12 @@ export class SessionBridge {
   // start a fresh message rather than appending into this one. Call after
   // flushing whenever something else is about to post into the thread.
   private closeAgentMessage(session: SessionState): void {
+    if (session.voiceSynthPending && session.agentChunks.length > 0) {
+      const text = session.agentChunks.join("").trim();
+      if (text) {
+        session.voiceTurnText += (session.voiceTurnText ? " " : "") + text;
+      }
+    }
     session.agentChunks = [];
     session.agentMessageTs = undefined;
     session.agentLastSent = undefined;
@@ -2278,12 +2294,15 @@ export class SessionBridge {
     text: string,
     images: ReadonlyArray<{ type: "image" | "audio"; mimeType: string; data: string }> = [],
     sourceSlackTs?: string,
+    fromVoice = false,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       log.warn(`sendUserPrompt for unknown session ${sessionId}`);
       return;
     }
+    session.voiceSynthPending = fromVoice;
+    session.voiceTurnText = "";
     // Estimate "ahead of us" optimistically from local state for the
     // initial queued indicator. Hydra's authoritative count arrives via
     // prompt_queue_added shortly after, but we want feedback in the
@@ -2479,6 +2498,7 @@ export class SessionBridge {
       await this.flushAgentMessage(session);
       this.closeAgentMessage(session);
       await this.finalizeSpinner(session, effectiveStopReason);
+      this.maybeSynthesizeVoiceResponse(session);
     });
     this.notificationChain = tail;
     try {
@@ -2842,6 +2862,29 @@ export class SessionBridge {
   }
 
   // Public entry point for the Block Kit "Cancel" button on the
+  // If the turn was triggered by a voice prompt, synthesize the accumulated
+  // agent text and upload the WAV to the thread. Fire-and-forget with catch.
+  private maybeSynthesizeVoiceResponse(session: SessionState): void {
+    if (!session.voiceSynthPending || !session.voiceTurnText) {
+      return;
+    }
+    const text = session.voiceTurnText;
+    session.voiceSynthPending = false;
+    session.voiceTurnText = "";
+    void (async () => {
+      try {
+        log.info(`synthesizing voice response (${text.length} chars)`);
+        const wav = await synthesizeText(text);
+        if (session.channel && session.threadTs) {
+          await this.opts.thread.uploadAudio(session.channel, session.threadTs, wav);
+          log.info(`voice response uploaded`);
+        }
+      } catch (err) {
+        log.warn(`voice synthesis failed: ${(err as Error).message}`);
+      }
+    })();
+  }
+
   // processing indicator or the spinner. Same wire call as the
   // :stop_sign: reaction path on those messages.
   cancelTurn(sessionId: string): boolean {
@@ -3113,6 +3156,11 @@ export class SessionBridge {
           await this.handleHeart(channel, ts);
         }
         return;
+      case "tts":
+        if (added) {
+          void this.handleTtsReaction(session, channel, ts);
+        }
+        return;
     }
   }
 
@@ -3219,6 +3267,25 @@ export class SessionBridge {
       return;
     }
     await this.opts.thread.updateMessage(channel, ts, collapsed);
+  }
+
+  private async handleTtsReaction(
+    session: SessionState,
+    channel: string,
+    ts: string,
+  ): Promise<void> {
+    const text = await this.opts.thread.fetchText(channel, ts);
+    if (!text?.trim()) {
+      return;
+    }
+    log.info(`tts reaction on ${ts}: ${text.slice(0, 80)}`);
+    try {
+      const wav = await synthesizeText(text);
+      const threadTs = session.threadTs ?? ts;
+      await this.opts.thread.uploadAudio(channel, threadTs, wav);
+    } catch (err) {
+      log.warn(`tts reaction failed: ${(err as Error).message}`);
+    }
   }
 
   private async handleHeart(channel: string, ts: string): Promise<void> {

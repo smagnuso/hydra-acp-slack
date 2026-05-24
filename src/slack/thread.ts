@@ -84,6 +84,20 @@ export class ThreadClient {
     }
   }
 
+  async uploadAudio(channel: string, threadTs: string, wav: Buffer): Promise<void> {
+    try {
+      await this.app.client.files.uploadV2({
+        channel_id: channel,
+        thread_ts: threadTs,
+        file: wav,
+        filename: "response.wav",
+        title: "Voice response",
+      });
+    } catch (err) {
+      log.warn(`audio upload threw: ${(err as Error).message}`);
+    }
+  }
+
   async addReaction(channel: string, ts: string, name: string): Promise<void> {
     try {
       await this.app.client.reactions.add({ channel, timestamp: ts, name });

@@ -8,7 +8,8 @@ export type ReactionAction =
   | "hide"
   | "expand_truncated"
   | "expand_full"
-  | "heart";
+  | "heart"
+  | "tts";
 
 const MAP: Record<string, ReactionAction> = {
   white_check_mark: "allow",
@@ -34,6 +35,9 @@ const MAP: Record<string, ReactionAction> = {
   book: "expand_full",
   open_book: "expand_full",
   books: "expand_full",
+
+  ear: "tts",
+  sound: "tts",
 
   heart: "heart",
   heart_eyes: "heart",

@@ -187,6 +187,13 @@ export function createSlackApp(config: Config): SlackApp {
         if (transcript) {
           text = text ? `${text}\n[Voice: ${transcript}]` : transcript;
           log.info(`transcribed audio: ${transcript.slice(0, 80)}`);
+          if (m.thread_ts) {
+            void app.client.chat.postMessage({
+              channel: m.channel!,
+              thread_ts: m.thread_ts,
+              text: `:microphone: _"${transcript}"_`,
+            }).catch(() => undefined);
+          }
         }
       } catch (err) {
         log.warn(`transcription failed: ${(err as Error).message}`);
@@ -272,6 +279,7 @@ export function createSlackApp(config: Config): SlackApp {
           forwardedText,
           imageBlocks,
           m.ts,
+          !bang && imageBlocks.some((b) => b.type === "audio"),
         );
         threadRegistry.promote(candidate.bridge, m.channel, m.thread_ts);
         routed = true;
