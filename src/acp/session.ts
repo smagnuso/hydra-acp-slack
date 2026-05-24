@@ -210,12 +210,6 @@ interface SessionState {
   // signal the originator receives. Used as targetMessageId for the
   // Amend button on queued indicators. Cleared on turn_complete.
   currentHeadMessageId: string | undefined;
-  // Guard against double-finalize. When an own-originated turn is
-  // amended, both the turn_complete notification (included because
-  // wasAmend=true) and the session/prompt response tail both call
-  // finalizeSpinner. The first wins; the second is skipped.
-  // Reset at the start of each own sendUserPrompt.
-  turnFinalizedOnce: boolean;
   // messageIds of cancelled turns that were actually amendments.
   // Populated by hydra-acp/prompt_amended (sent to all clients, no
   // exclusion). Checked in the sendUserPrompt response path so own
@@ -1373,10 +1367,7 @@ export class SessionBridge {
     // When an own-originated turn is amended, turn_complete (notification,
     // included because wasAmend=true) and the sendUserPrompt response tail
     // both call finalizeSpinner. Let the first one win and skip the rest.
-    if (session.turnFinalizedOnce) {
-      return;
-    }
-    session.turnFinalizedOnce = true;
+    log.info(`finalize run ${session.sessionId.slice(0, 8)} stopReason=${stopReason ?? "none"} spinnerTs=${session.spinnerTs ? "set" : "none"}`);
     const ts = session.spinnerTs;
     const processingTs = session.processingTs;
     const expanded = session.spinnerExpanded;
@@ -1544,7 +1535,6 @@ export class SessionBridge {
       sourceTsToEntry: new Map(),
       processingTs: undefined,
       currentHeadMessageId: undefined,
-      turnFinalizedOnce: false,
       recentlyAmendedIds: new Set(),
       userChunks: [],
       title: undefined,
@@ -2400,8 +2390,6 @@ export class SessionBridge {
       : ownBarrier;
     session.pendingOwnTurnEnd = myBarrier;
 
-    // Reset so the double-finalize guard doesn't carry over from a prior turn.
-    session.turnFinalizedOnce = false;
     let stopReason: string | undefined;
     try {
       const response = await this.opts.attach.request<{
@@ -2487,6 +2475,7 @@ export class SessionBridge {
         session.recentlyAmendedIds.delete(queuedEntry.messageId);
         effectiveStopReason = "amended";
       }
+      log.info(`own-turn tail ${session.sessionId.slice(0, 8)} effectiveStopReason=${effectiveStopReason ?? "none"} amendedIdsSize=${session.recentlyAmendedIds.size}`);
       await this.flushAgentMessage(session);
       this.closeAgentMessage(session);
       await this.finalizeSpinner(session, effectiveStopReason);
@@ -2847,11 +2836,7 @@ export class SessionBridge {
       }
     }
     await this.opts.thread
-      .updateMessage(
-        session.channel,
-        promptTs,
-        formatAmendedQueuedIndicator(text),
-      )
+      .deleteMessage(session.channel, promptTs)
       .catch(() => undefined);
     return true;
   }
