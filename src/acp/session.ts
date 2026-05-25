@@ -1950,6 +1950,12 @@ export class SessionBridge {
     if (!meta) return;
     const hydra = meta["hydra-acp"];
     if (!hydra || typeof hydra !== "object" || Array.isArray(hydra)) return;
+    // Standard ACP: models.currentModelId on the session/attach response.
+    const currentModelId = this.opts.attach.attachModels?.currentModelId;
+    if (currentModelId && session.modelId !== currentModelId) {
+      session.modelId = currentModelId;
+      await this.refreshParent(session).catch(() => undefined);
+    }
     const queue = (hydra as Record<string, unknown>).queue;
     if (!Array.isArray(queue)) return;
     const ownClientId = this.opts.attach.clientId;
@@ -3621,7 +3627,7 @@ function agentWithModel(
     return undefined;
   }
   const short = shortenModel(model);
-  return short ? `${agent} · ${short}` : agent;
+  return short ? `${agent}·${short}` : agent;
 }
 
 // Pull the hydra agentId from an update's _meta extension namespace.

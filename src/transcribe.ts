@@ -1,4 +1,4 @@
-import { pipeline, env } from "@xenova/transformers";
+import { pipeline, env } from "@huggingface/transformers";
 // Provide Web Audio API for Node.js so the pipeline can decode audio files.
 import { AudioContext } from "node-web-audio-api";
 (globalThis as Record<string, unknown>).AudioContext = AudioContext;
