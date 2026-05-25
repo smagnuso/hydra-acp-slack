@@ -3560,12 +3560,7 @@ function renderParent(opts: {
     opts.title ?? (opts.cwd ? basename(opts.cwd) : undefined);
   const lines: string[] = [];
   if (heading) {
-    // Model in the bold heading line so it shows up in Slack's thread
-    // previews (sidebar / channel listing / link unfurls), where only
-    // the first line is visible. Re-rendered on current_model_update.
-    const short = shortenModel(opts.modelId);
-    const suffix = short ? ` \`${short}\`` : "";
-    lines.push(`:robot_face: *${heading}*${suffix}`);
+    lines.push(`:robot_face: *${heading}*`);
   }
   const tailParts: string[] = [];
   if (opts.cwd) {

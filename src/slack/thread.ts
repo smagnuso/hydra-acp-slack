@@ -123,7 +123,12 @@ export class ThreadClient {
     channel: string,
     sessionId: string,
   ): Promise<string | undefined> {
-    const marker = `_session ${sessionId}_`;
+    // Match both the old full-id marker and the new short-id marker so
+    // threads created before the prefix-stripping change are still found.
+    const shortId = sessionId.startsWith("hydra_session_")
+      ? sessionId.slice("hydra_session_".length)
+      : sessionId;
+    const markers = [`_session ${sessionId}_`, `_session ${shortId}_`];
     let cursor: string | undefined;
     let scanned = 0;
     const cap = 1000;
@@ -146,7 +151,7 @@ export class ThreadClient {
         if (typeof m.text !== "string") {
           continue;
         }
-        if (m.text.includes(marker)) {
+        if (markers.some((mk) => m.text?.includes(mk))) {
           const ts = m.thread_ts ?? m.ts;
           if (typeof ts === "string") {
             return ts;
@@ -218,5 +223,9 @@ export class ThreadClient {
 // in the message text (Slack metadata would also work, but text is
 // scope-free and survives chat.update without ceremony).
 export function sessionMarker(sessionId: string): string {
-  return `_session ${sessionId}_`;
+  // Strip the common "hydra_session_" prefix to keep the marker compact.
+  const short = sessionId.startsWith("hydra_session_")
+    ? sessionId.slice("hydra_session_".length)
+    : sessionId;
+  return `_session ${short}_`;
 }

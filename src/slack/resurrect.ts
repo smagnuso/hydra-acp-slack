@@ -62,7 +62,11 @@ export async function findSessionIdForThread(
       return undefined;
     }
     const match = SESSION_MARKER_RE.exec(msg.text);
-    return match?.[1];
+    const id = match?.[1];
+    if (!id) return undefined;
+    // New threads omit the "hydra_session_" prefix in the marker; old
+    // threads include it. Normalise both back to the full session id.
+    return id.startsWith("hydra_session_") ? id : `hydra_session_${id}`;
   } catch (err) {
     log.warn(`thread parent fetch failed: ${(err as Error).message}`);
     return undefined;
