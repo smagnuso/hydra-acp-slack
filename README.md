@@ -241,6 +241,9 @@ it accepts.
 | `HYDRA_WS_URL`              | derived from `HYDRA_DAEMON_URL`    | WebSocket endpoint for ACP attach. Defaults to `ws[s]://<host>:<port>/acp`. |
 | `HYDRA_TOKEN`               | (required)                         | Bearer token for hydra. Set automatically when run as a hydra extension. |
 | `HYDRA_POLL_INTERVAL_MS`    | `2000`                             | How often to poll hydra for session changes. |
+| `DELETE_ABANDONED_THREADS`  | `false`                            | Janitor: scan known channels for `_session <id>_` thread parents whose session is no longer in hydra (live or cold) and delete the whole thread (every reply, then the parent). When `false` (default) the sweep still runs and logs `would delete abandoned thread session=<id> …` on first detection so you can validate matches before enabling. **Delete mode requires the candidate to miss two consecutive sweeps**, so a transient daemon read failure can't trigger deletions; dry-run logs immediately and dedupes per-process. Capped at 3 threads per sweep since each one issues N+1 `chat.delete` calls. |
+| `THREAD_JANITOR_INTERVAL_MS`| `60000` (delete) / `300000` (dry-run) | How often the janitor sweeps. Defaults depend on `DELETE_ABANDONED_THREADS`: 1 min when enabled (prompt cleanup), 5 min in dry-run (each sweep pages `conversations.history` across known channels, and nothing changes between sweeps once dedupe is populated). |
+| `THREAD_JANITOR_SETTLE_MS`  | `5000`                             | Delay before the first sweep so initial attaches can register. The daemon-list check covers any straggler, so this can be small. |
 | `DEBUG`                     | `false`                            | Verbose logging. |
 
 ## Reactions

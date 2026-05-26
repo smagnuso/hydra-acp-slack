@@ -112,6 +112,10 @@ export class ChannelMap {
     return this.map.get(projectPath);
   }
 
+  values(): string[] {
+    return [...this.map.values()];
+  }
+
   set(projectPath: string, channelId: string): void {
     this.map.set(projectPath, channelId);
     try {

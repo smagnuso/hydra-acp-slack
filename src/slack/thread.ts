@@ -84,6 +84,49 @@ export class ThreadClient {
     }
   }
 
+  // Delete every message in a thread: pages through conversations.replies
+  // to collect all reply ts values, deletes each, then the parent last so
+  // the thread isn't visually orphaned mid-cleanup. Idempotent — relies on
+  // deleteMessage to swallow message_not_found.
+  async deleteThread(channel: string, threadTs: string): Promise<number> {
+    const replyTs: string[] = [];
+    let cursor: string | undefined;
+    while (true) {
+      let res;
+      try {
+        res = await this.app.client.conversations.replies({
+          channel,
+          ts: threadTs,
+          cursor,
+          limit: 200,
+        });
+      } catch (err) {
+        log.warn(
+          `deleteThread: conversations.replies(${channel}/${threadTs}) failed: ${(err as Error).message}`,
+        );
+        break;
+      }
+      for (const m of res.messages ?? []) {
+        if (typeof m.ts !== "string") {
+          continue;
+        }
+        if (m.ts === threadTs) {
+          continue;
+        }
+        replyTs.push(m.ts);
+      }
+      cursor = res.response_metadata?.next_cursor;
+      if (!cursor) {
+        break;
+      }
+    }
+    for (const ts of replyTs) {
+      await this.deleteMessage(channel, ts);
+    }
+    await this.deleteMessage(channel, threadTs);
+    return replyTs.length + 1;
+  }
+
   async uploadAudio(channel: string, threadTs: string, wav: Buffer): Promise<void> {
     try {
       await this.app.client.files.uploadV2({
@@ -167,6 +210,63 @@ export class ThreadClient {
     return undefined;
   }
 
+  // Scan a channel's recent history for every thread-parent that
+  // carries a `_session <id>_` marker. Pages through conversations.history
+  // with the same ~1000-message cap as findSessionThread. Returns one
+  // entry per matching message (sessionId normalised to canonical form,
+  // threadTs falls back to ts when the message is itself the parent).
+  async listSessionThreads(
+    channel: string,
+  ): Promise<Array<{ sessionId: string; threadTs: string }>> {
+    const found = new Map<string, string>();
+    let cursor: string | undefined;
+    let scanned = 0;
+    const cap = 1000;
+    while (scanned < cap) {
+      let res;
+      try {
+        res = await this.app.client.conversations.history({
+          channel,
+          cursor,
+          limit: 100,
+        });
+      } catch (err) {
+        log.warn(
+          `listSessionThreads: conversations.history(${channel}) failed: ${(err as Error).message}`,
+        );
+        break;
+      }
+      const messages = res.messages ?? [];
+      for (const m of messages) {
+        if (typeof m.text !== "string") {
+          continue;
+        }
+        const match = SESSION_MARKER_RE.exec(m.text);
+        const short = match?.[1];
+        if (!short) {
+          continue;
+        }
+        const ts = m.thread_ts ?? m.ts;
+        if (typeof ts !== "string") {
+          continue;
+        }
+        const sessionId = canonicalSessionId(short);
+        if (!found.has(sessionId)) {
+          found.set(sessionId, ts);
+        }
+      }
+      scanned += messages.length;
+      cursor = res.response_metadata?.next_cursor;
+      if (!cursor) {
+        break;
+      }
+    }
+    return [...found.entries()].map(([sessionId, threadTs]) => ({
+      sessionId,
+      threadTs,
+    }));
+  }
+
   // Upload arbitrary text content as a file in a thread. Used for the
   // session-end bundle dump.
   async uploadFile(opts: {
@@ -228,4 +328,12 @@ export function sessionMarker(sessionId: string): string {
     ? sessionId.slice("hydra_session_".length)
     : sessionId;
   return `_session ${short}_`;
+}
+
+// Matches the marker emitted by sessionMarker. Captures the short id;
+// callers re-prefix `hydra_session_` to get the canonical form.
+export const SESSION_MARKER_RE = /_session ([0-9A-Za-z_-]+)_/;
+
+export function canonicalSessionId(short: string): string {
+  return short.startsWith("hydra_session_") ? short : `hydra_session_${short}`;
 }

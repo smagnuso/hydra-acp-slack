@@ -38,6 +38,14 @@ export interface Config {
   // auto-approver answers — no Slack message is ever posted, avoiding a
   // transient :lock: that gets deleted moments later. 0 disables.
   permissionDisplayDelayMs: number;
+  // Janitor: scan known channels for `_session <id>_` markers whose
+  // sessionId is no longer in the daemon's session list (live OR cold)
+  // and delete the thread parent. When false, the sweep still runs but
+  // only logs "would delete …" — for validating output before flipping
+  // the flag on.
+  deleteAbandonedThreads: boolean;
+  threadJanitorIntervalMs: number;
+  threadJanitorSettleMs: number;
   debug: boolean;
 }
 
@@ -182,6 +190,17 @@ export function loadConfig(path: string = configPath()): Config {
     backfillHistory: bool(map, "BACKFILL_HISTORY", false),
     liveQuietMs: intVal(map, "LIVE_QUIET_MS", 2000),
     permissionDisplayDelayMs: intVal(map, "PERMISSION_DELAY_MS", 500),
+    deleteAbandonedThreads: bool(map, "DELETE_ABANDONED_THREADS", false),
+    threadJanitorIntervalMs: intVal(
+      map,
+      "THREAD_JANITOR_INTERVAL_MS",
+      // Sweeps scan conversations.history across every known channel,
+      // which isn't free. When delete is enabled you want prompt
+      // cleanup; in dry-run nothing changes between sweeps once the
+      // dedupe set is populated, so we can afford a much slower cadence.
+      bool(map, "DELETE_ABANDONED_THREADS", false) ? 60_000 : 300_000,
+    ),
+    threadJanitorSettleMs: intVal(map, "THREAD_JANITOR_SETTLE_MS", 5_000),
     debug: bool(map, "DEBUG", false),
   };
 }

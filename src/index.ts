@@ -15,6 +15,7 @@ import { HydraDiscovery } from "./hydra-discovery.js";
 import { createSlackApp } from "./slack/app.js";
 import { consumePendingMessages } from "./slack/resurrect.js";
 import { ThreadClient } from "./slack/thread.js";
+import { ThreadJanitor } from "./slack/thread-janitor.js";
 import { ChannelMap } from "./storage/channels.js";
 import { HiddenStore } from "./storage/hidden.js";
 import { TruncatedStore } from "./storage/truncated.js";
@@ -144,11 +145,25 @@ async function main(): Promise<void> {
   });
   discovery.start();
 
+  const janitor = new ThreadJanitor({
+    thread,
+    channels,
+    slackChannelId: config.slackChannelId,
+    daemonUrl: config.hydraDaemonUrl,
+    token: config.hydraToken,
+    deleteEnabled: config.deleteAbandonedThreads,
+    isLiveBridge: (id) => bridges.has(id),
+    intervalMs: config.threadJanitorIntervalMs,
+    settleMs: config.threadJanitorSettleMs,
+  });
+  janitor.start();
+
   const shutdown = async (signal: string) => {
     log.info(`received ${signal}, shutting down`);
     clearInterval(flushTimer);
     try {
       discovery.stop();
+      janitor.stop();
       // Flush any pending text before tearing down.
       for (const ctx of bridges.values()) {
         await ctx.bridge.flushAll().catch(() => undefined);

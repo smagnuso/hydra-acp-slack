@@ -2,13 +2,9 @@ import bolt from "@slack/bolt";
 import { AcpAttach } from "../acp/attach.js";
 import type { Config } from "../config.js";
 import { logger } from "../util/log.js";
+import { SESSION_MARKER_RE, canonicalSessionId } from "./thread.js";
 
 const log = logger("resurrect");
-
-// Matches the `_session <id>_` italic line emitted by renderParent's
-// sessionMarker. Captures the id so we can route a Slack message to a
-// cold (on-disk) session without any local registry state.
-const SESSION_MARKER_RE = /_session ([0-9A-Za-z_-]+)_/;
 
 export interface PendingMessage {
   text: string;
@@ -63,10 +59,12 @@ export async function findSessionIdForThread(
     }
     const match = SESSION_MARKER_RE.exec(msg.text);
     const id = match?.[1];
-    if (!id) return undefined;
+    if (!id) {
+      return undefined;
+    }
     // New threads omit the "hydra_session_" prefix in the marker; old
     // threads include it. Normalise both back to the full session id.
-    return id.startsWith("hydra_session_") ? id : `hydra_session_${id}`;
+    return canonicalSessionId(id);
   } catch (err) {
     log.warn(`thread parent fetch failed: ${(err as Error).message}`);
     return undefined;
