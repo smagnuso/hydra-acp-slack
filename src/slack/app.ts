@@ -99,14 +99,22 @@ export function createSlackApp(config: Config): SlackApp {
         bot_id?: string;
       };
     }>;
-    const preview = (m.text ?? "").slice(0, 60);
-    log.info(
-      `inbound msg user=${m.user ?? "?"} channel=${m.channel ?? "?"} thread=${m.thread_ts ?? "(none)"} subtype=${m.subtype ?? "(none)"} bot=${m.bot_id ?? "(none)"} ts=${m.ts ?? "?"} text="${preview}"`,
-    );
-    if (m.bot_id) {
-      log.info(`drop: bot=${m.bot_id}`);
+    // Our own chat.update / chat.delete calls (spinners, streamed agent
+    // messages, header refreshes, etc.) come back to us as
+    // message_changed / message_deleted events. For those subtypes Slack
+    // puts bot_id inside the nested envelopes, not on the outer event,
+    // so checking only m.bot_id misses them and the noisy inbound-msg
+    // log fires for every self-edit. Detect both shapes up front and
+    // bail before logging.
+    const botEcho =
+      m.bot_id ?? m.message?.bot_id ?? m.previous_message?.bot_id;
+    if (botEcho) {
       return;
     }
+    const preview = (m.text ?? "").slice(0, 60);
+    log.info(
+      `inbound msg user=${m.user ?? "?"} channel=${m.channel ?? "?"} thread=${m.thread_ts ?? "(none)"} subtype=${m.subtype ?? "(none)"} ts=${m.ts ?? "?"} text="${preview}"`,
+    );
     // Slack delivers edits as subtype="message_changed" and deletions as
     // subtype="message_deleted". Both target a previously-queued prompt
     // by its source `ts`; route to dedicated handlers and skip the
