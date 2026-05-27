@@ -23,7 +23,8 @@
         "groups:read",
         "groups:write",
         "im:history",
-        "reactions:read"
+        "reactions:read",
+        "users:read"
       ]
     },
     "pkce_enabled": false

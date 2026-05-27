@@ -37,89 +37,64 @@ forwarded back via `session/prompt`.
 
 ## Setup
 
-### 1. Create the Slack app
-
-The fastest path is to use the **app manifest** included in this repo
-([`assets/slack-manifest.json`](assets/slack-manifest.json)) — it
-pre-fills every scope and event subscription the bridge needs, so you
-don't have to click through OAuth and Event Subscriptions tabs one box
-at a time.
-
-1. Go to https://api.slack.com/apps → **Create New App** → **From a
-   manifest**.
-2. Pick the workspace you want the bot to live in. Click **Next**.
-3. **Paste the contents of `assets/slack-manifest.json`** from this
-   repo. Slack defaults to YAML; switch the toggle to **JSON** so the
-   paste parses cleanly. Click **Next**, then **Create**.
-4. After creation, Slack drops you in **Basic Information**. Two
-   credentials live elsewhere — go fetch them:
-   - **Bot User OAuth Token** — left sidebar → **OAuth & Permissions** →
-     scroll to "OAuth Tokens for Your Workspace". You'll see "Install to
-     Workspace" first; click it, approve, and the page comes back with
-     the bot token (starts with `xoxb-...`). Copy it.
-   - **App-Level Token** — left sidebar → **Basic Information** → scroll
-     to "App-Level Tokens" → **Generate Token and Scopes** → name it
-     anything → check `connections:write` → **Generate**. Copy the
-     `xapp-...` token shown once.
-5. **Invite the bot to a channel.** In Slack itself, in whichever
-   channel you want hydra to post to, type `/invite @HydraSlackAgent`
-   (or whatever you renamed the bot to). You can't post to a channel
-   the bot isn't a member of.
-6. **Grab the channel ID.** In Slack, click the channel name at the top
-   → **About** tab → scroll to the bottom — the channel ID (starts with
-   `C` for public, `G` for private) is shown there. You'll paste this
-   into the config below.
-
-If you'd rather build the app from scratch instead of using the
-manifest, the manual flow is:
-
-- Bot scopes: `commands`, `channels:history`, `channels:read`,
-  `chat:write`, `files:read`, `files:write`, `groups:history`, `groups:read`,
-  `groups:write`, `im:history`, `reactions:read`.
-- Enable **Socket Mode** in the Settings tab.
-- Subscribe to bot events: `message.channels`, `message.groups`,
-  `message.im`, `reaction_added`, `reaction_removed`.
-- Enable **Interactivity** under Interactivity & Shortcuts.
-- Generate an app-level token with `connections:write` and install the
-  app to your workspace to mint the bot token.
-
-### 2. Write the config file
-
-Place credentials at `~/.hydra-acp/slack.conf`. This is a plain
-`KEY=VALUE` file — quotes optional, comments with `#`. The bridge
-reads it on startup; tokens never live in env vars or shell history.
-
-```
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-SLACK_CHANNEL_ID=C0123456789
-
-AUTHORIZED_USERS=U12345678,U23456789
-WEBSOCKET_STALE_THRESHOLD=7200
-DEBUG=false
-```
-
-Lock it down — these tokens give full read/write access to whichever
-channels the bot is in, so treat them like API keys:
+### 1. Create the Slack app and write the config
 
 ```sh
-chmod 600 ~/.hydra-acp/slack.conf
+npx @hydra-acp/slack setup
+# or, after installing globally: hydra-acp-slack setup
 ```
 
+The wizard creates a Slack app from the manifest in this repo, runs the
+OAuth dance through a local callback server, prompts you for the
+App-Level token (the one piece Slack's API can't generate), optionally
+lets you pick a channel from the ones the bot has been invited to, and
+writes `~/.hydra-acp/slack.conf` with mode `600`. About 3–5 minutes;
+two browser visits.
+
+Re-run `hydra-acp-slack setup` any time to sync the deployed Slack app's
+manifest with whatever's in this repo — useful when scopes or events
+change in a release.
+
 `AUTHORIZED_USERS` is the allowlist of Slack user IDs whose messages
-the bridge will forward to the agent as prompts (and whose reactions
-are honored for allow/deny/cancel). To find your own user ID, click
-your profile in Slack → **More** → **Copy member ID**.
+the bridge will forward to the agent (and whose reactions are honored
+for allow/deny/cancel). The wizard seeds it with your own ID. To add
+teammates, append comma-separated user IDs; find one by clicking a
+profile in Slack → **More** → **Copy member ID**.
 
 > ⚠️ **Leaving `AUTHORIZED_USERS` empty means there is no allowlist —
-> anyone the bot can see (i.e. anyone in the channels the bot is
-> invited to) can prompt the agent and approve tool calls.** That's a
-> reasonable default for a personal bot in a single-member workspace,
-> but if other people share the workspace, set this to your own user
-> ID (and any teammates you trust) before adding the bot to shared
-> channels.
+> anyone the bot can see can prompt the agent and approve tool calls.**
+> Fine for a personal bot in a single-member workspace; set it before
+> adding the bot to shared channels.
 
-### 3. State directory
+<details>
+<summary>Manual setup (if you prefer not to run the wizard)</summary>
+
+1. Go to https://api.slack.com/apps → **Create New App** → **From a
+   manifest**. Pick the workspace. Paste the contents of
+   [`assets/slack-manifest.json`](assets/slack-manifest.json) (toggle
+   the editor to JSON first). Click **Next**, then **Create**.
+2. **OAuth & Permissions** → **Install to Workspace**. Copy the
+   `xoxb-...` Bot User OAuth Token.
+3. **Basic Information** → scroll to **App-Level Tokens** → **Generate
+   Token and Scopes** → name it anything → check `connections:write` →
+   **Generate**. Copy the `xapp-...` token.
+4. In Slack, `/invite @<your-bot>` in whichever channel you want
+   hydra to post in. Click the channel name → **About** → scroll to
+   the bottom for the channel ID.
+5. Write `~/.hydra-acp/slack.conf`:
+
+   ```
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_APP_TOKEN=xapp-...
+   SLACK_CHANNEL_ID=C0123456789
+   AUTHORIZED_USERS=U12345678
+   ```
+
+   Then `chmod 600 ~/.hydra-acp/slack.conf`.
+
+</details>
+
+### 2. State directory
 
 The bridge owns one directory on disk: `~/.hydra-acp/slack/`. It's
 created lazily as the bridge runs; you don't need to set it up by
@@ -155,7 +130,7 @@ required. Editor save styles that do atomic rename-over-original
 deleted file just leaves the previous map in place and logs a
 warning so a typo doesn't blow away routing for active sessions.
 
-### 4. Install or build
+### 3. Install or build
 
 From npm (recommended):
 
@@ -174,7 +149,7 @@ npm install
 npm run build
 ```
 
-### 5. Run as a hydra extension (recommended)
+### 4. Run as a hydra extension (recommended)
 
 Register the extension with hydra. If installed via npm:
 
@@ -211,7 +186,7 @@ land in `~/.hydra-acp/extensions/hydra-acp-slack.log`. Lifecycle is managed
 with `hydra-acp extensions start|stop|restart hydra-acp-slack` and
 `hydra-acp extensions log hydra-acp-slack -f` to tail.
 
-### 6. Run standalone (alternative)
+### 5. Run standalone (alternative)
 
 Set `HYDRA_DAEMON_URL` and `HYDRA_TOKEN` in `~/.hydra-acp/slack.conf`
 (or export them as env vars), then:

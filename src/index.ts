@@ -41,10 +41,30 @@ function readVersion(): string {
   }
 }
 
+function printUsage(): void {
+  process.stdout.write(
+    `hydra-acp-slack ${readVersion()}\n\n` +
+      `Usage:\n` +
+      `  hydra-acp-slack           Start the bridge daemon (default)\n` +
+      `  hydra-acp-slack setup     Interactive Slack-app setup wizard\n` +
+      `  hydra-acp-slack --version Print version\n` +
+      `  hydra-acp-slack --help    Show this message\n`,
+  );
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.includes("--version") || argv.includes("-v")) {
     process.stdout.write(`hydra-acp-slack ${readVersion()}\n`);
+    return;
+  }
+  if (argv.includes("--help") || argv.includes("-h")) {
+    printUsage();
+    return;
+  }
+  if (argv[0] === "setup") {
+    const { runSetup } = await import("./setup/wizard.js");
+    await runSetup();
     return;
   }
 
