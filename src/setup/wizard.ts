@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
-import { userInfo } from "node:os";
-import { dirname, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { readFileSync, statSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ask, askSecret, confirm, maskToken, openBrowser, pause, pickFromList } from "./prompts.js";
 import { callSlack, callSlackForm, exchangeOAuthCode, SlackApiError } from "./slack-api.js";
@@ -59,6 +60,25 @@ interface SlackManifest {
 function manifestPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   return resolve(here, "../../assets/slack-manifest.json");
+}
+
+function hasBin(name: string): boolean {
+  const dirs = (process.env.PATH ?? "").split(delimiter);
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const dir of dirs) {
+    if (!dir)
+      continue;
+    for (const ext of exts) {
+      const full = join(dir, name + ext);
+      try {
+        if (statSync(full).isFile())
+          return true;
+      } catch {
+        // not present in this dir; keep looking
+      }
+    }
+  }
+  return false;
 }
 
 function defaultBotName(): string {
@@ -582,6 +602,71 @@ async function manifestSync(args: { existingBotToken: string; existingAppId: str
   }
 }
 
+async function step7RegisterExtension(): Promise<void> {
+  header(7, TOTAL_STEPS, "Register with hydra (optional)");
+
+  if (!hasBin("hydra-acp")) {
+    info("hydra-acp not found on PATH. Register manually later with:");
+    info("  hydra-acp extensions add hydra-acp-slack");
+    return;
+  }
+
+  const hydraConfigPath = resolve(homedir(), ".hydra-acp", "config.json");
+  let alreadyRegistered = false;
+  try {
+    const cfg = JSON.parse(readFileSync(hydraConfigPath, "utf8")) as {
+      extensions?: Record<string, unknown>;
+    };
+    if (cfg.extensions && "hydra-acp-slack" in cfg.extensions)
+      alreadyRegistered = true;
+  } catch {
+    // No config or invalid JSON — treat as not registered.
+  }
+
+  if (alreadyRegistered) {
+    ok("Already registered as a hydra extension.");
+    info("Restart the daemon to pick up the new tokens: hydra-acp daemon restart");
+    return;
+  }
+
+  info("hydra can manage hydra-acp-slack as a subprocess that auto-starts with");
+  info("the daemon. This adds an entry to ~/.hydra-acp/config.json.");
+  blank();
+  if (!(await confirm("Register hydra-acp-slack as a hydra extension?", true))) {
+    info("Skipping. Register later with:");
+    info("  hydra-acp extensions add hydra-acp-slack");
+    return;
+  }
+
+  const cmdArgs = ["extensions", "add", "hydra-acp-slack"];
+  if (!hasBin("hydra-acp-slack")) {
+    const scriptPath = process.argv[1] ?? "";
+    if (!scriptPath) {
+      warn("Couldn't determine script path; falling back to bare command.");
+    } else if (scriptPath.includes("/.npm/_npx/")) {
+      warn("Looks like you're running via npx — registering this transient path");
+      warn("would break on the next npx cache cleanup. Install globally first:");
+      info("  npm install -g @hydra-acp/slack");
+      info("Then register with: hydra-acp extensions add hydra-acp-slack");
+      return;
+    } else {
+      cmdArgs.push("--command", "node", "--args", scriptPath);
+    }
+  }
+
+  info(`Running: hydra-acp ${cmdArgs.join(" ")}`);
+  const result = spawnSync("hydra-acp", cmdArgs, { stdio: "inherit" });
+  if (result.status === 0) {
+    ok("Registered.");
+    info("Start the daemon (or restart if already running): hydra-acp daemon restart");
+  } else {
+    blank();
+    warn(`hydra-acp exited with code ${result.status ?? "?"}.`);
+    info("Register manually later with:");
+    info(`  hydra-acp ${cmdArgs.join(" ")}`);
+  }
+}
+
 export async function runSetup(): Promise<void> {
   process.stdout.write(`\n  ${BOLD}hydra-acp-slack setup${RESET}\n`);
 
@@ -606,10 +691,10 @@ export async function runSetup(): Promise<void> {
     installingUserId: step3.installingUserId,
     additionalUserIds: step5.additionalUserIds,
   });
+  await step7RegisterExtension();
 
   blank();
   ok("Setup complete.");
-  info("Start the bridge with: hydra-acp-slack");
   if (!step5.channelId)
-    info("Then invite the bot to a channel and add SLACK_CHANNEL_ID to slack.conf.");
+    info("Invite the bot to a channel and add SLACK_CHANNEL_ID to slack.conf.");
 }
