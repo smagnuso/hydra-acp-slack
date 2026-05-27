@@ -2425,9 +2425,20 @@ export class SessionBridge {
       });
       stopReason = response?.stopReason;
     } catch (err) {
+      const message = (err as Error).message;
       log.warn(
-        `prompt request failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+        `prompt request failed for ${sessionId.slice(0, 8)}: ${message}`,
       );
+      stopReason = "error";
+      if (session.threadTs) {
+        await this.opts.thread
+          .postMessage({
+            channel: session.channel,
+            threadTs: session.threadTs,
+            text: `:warning: ${message}`,
+          })
+          .catch(() => undefined);
+      }
     } finally {
       // Drop the local entry. queueByMessageId was already cleared by
       // the prompt_queue_removed handler that fired when this turn
