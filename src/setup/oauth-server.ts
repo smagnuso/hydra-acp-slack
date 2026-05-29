@@ -30,11 +30,21 @@ export async function startOAuthServer(port: number): Promise<OAuthServer> {
     }
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state") ?? undefined;
+    const err = url.searchParams.get("error");
     if (!code) {
+      // Slack explicitly denied the grant — surface the reason and stop.
+      if (err) {
+        const desc = url.searchParams.get("error_description");
+        res.statusCode = 400;
+        res.end(`OAuth denied: ${err}`);
+        reject?.(new Error(desc ? `${err} — ${desc}` : err));
+        return;
+      }
+      // A bare hit with no code and no error (favicon probe, manual visit,
+      // duplicate request). Don't tear down the flow; keep waiting for the
+      // real redirect from Slack.
       res.statusCode = 400;
-      res.end("Missing code parameter");
-      const err = url.searchParams.get("error");
-      reject?.(new Error(err ? `OAuth denied: ${err}` : "OAuth callback missing 'code'"));
+      res.end("Waiting for the Slack authorization redirect. You can close this tab.");
       return;
     }
     res.statusCode = 200;

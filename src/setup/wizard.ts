@@ -221,14 +221,21 @@ async function step2CreateApp(): Promise<Step2Result> {
           for (const e of errs)
             warn(`  ${typeof e === "object" ? JSON.stringify(e) : String(e)}`);
         }
+        blank();
+        if (!(await confirm("Try a different name?", true)))
+          fail("Aborted at app creation.");
+        name = await ask("App name", name);
+        display = await ask("Bot display name", name);
       } else {
+        // Network / transport error (e.g. "fetch failed"), not a Slack rejection.
+        // The name is fine; the request never reached Slack, so offer a retry.
         warn(`apps.manifest.create failed: ${(err as Error).message}`);
+        warn("This looks like a network error — the request didn't reach Slack.");
+        warn("Check your connection and that the App Configuration Token is valid.");
+        blank();
+        if (!(await confirm("Retry?", true)))
+          fail("Aborted at app creation.");
       }
-      blank();
-      if (!(await confirm("Try a different name?", true)))
-        fail("Aborted at app creation.");
-      name = await ask("App name", name);
-      display = await ask("Bot display name", name);
     }
   }
 }

@@ -71,35 +71,48 @@ export async function askSecret(label: string): Promise<string> {
   }
   const stdin = process.stdin;
   const wasRaw = stdin.isRaw;
+  const wasPaused = stdin.isPaused();
   stdin.setRawMode(true);
   stdin.resume();
   stdin.setEncoding("utf8");
   let buf = "";
   try {
-    for await (const chunk of stdin as AsyncIterable<string>) {
-      let done = false;
-      for (const ch of chunk) {
-        const code = ch.charCodeAt(0);
-        if (ch === "\r" || ch === "\n") {
-          done = true;
-          break;
+    await new Promise<void>((resolve) => {
+      const onData = (chunk: string): void => {
+        for (const ch of chunk) {
+          const code = ch.charCodeAt(0);
+          if (ch === "\r" || ch === "\n") {
+            cleanup();
+            resolve();
+            return;
+          }
+          if (code === 3) {
+            cleanup();
+            process.stdout.write("\n");
+            process.exit(1);
+          }
+          if (code === 127 || code === 8) {
+            if (buf.length > 0) {
+              buf = buf.slice(0, -1);
+              process.stdout.write("\b \b");
+            }
+            continue;
+          }
+          if (code < 32)
+            continue;
+          buf += ch;
+          process.stdout.write("*");
         }
-        if (code === 3) {
-          process.stdout.write("\n");
-          process.exit(1);
-        }
-        if (code === 127 || code === 8) {
-          buf = buf.slice(0, -1);
-          continue;
-        }
-        buf += ch;
-      }
-      if (done)
-        break;
-    }
+      };
+      const cleanup = (): void => {
+        stdin.removeListener("data", onData);
+      };
+      stdin.on("data", onData);
+    });
   } finally {
     stdin.setRawMode(wasRaw);
-    stdin.pause();
+    if (wasPaused)
+      stdin.pause();
     process.stdout.write("\n");
   }
   return buf.trim();
