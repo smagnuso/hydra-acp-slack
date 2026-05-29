@@ -21,10 +21,11 @@ import {
 import { reactionAction } from "./reaction-map.js";
 import { transcribeAudio } from "../transcribe.js";
 import { threadRegistry } from "./registry.js";
+import type { AdopterRef } from "./adopter.js";
 import {
-  attemptResurrect,
   bufferPendingMessage,
   findSessionIdForThread,
+  fetchSessionInfo,
 } from "./resurrect.js";
 
 const log = logger("slack");
@@ -45,7 +46,10 @@ export interface SlackApp {
   stop(): Promise<void>;
 }
 
-export function createSlackApp(config: Config): SlackApp {
+export function createSlackApp(
+  config: Config,
+  adopterRef: AdopterRef,
+): SlackApp {
   // Construct the receiver explicitly so the staleness watchdog below
   // can access its underlying SocketModeClient. Passing socketMode:true
   // to bolt.App also creates one, but stores it as a private field.
@@ -145,7 +149,7 @@ export function createSlackApp(config: Config): SlackApp {
     }
     const rawText = (m.text ?? "").trim();
     if (rawText.startsWith("!session")) {
-      await handleSessionCommand(app, config, rawText, m.channel, m.ts);
+      await handleSessionCommand(app, config, adopterRef, rawText, m.channel, m.ts);
       return;
     }
     if (rawText === "!agents") {
@@ -209,11 +213,16 @@ export function createSlackApp(config: Config): SlackApp {
       }
     }
     if (candidates.length === 0) {
-      // Thread has no live bridge — likely a cold session whose disk
-      // record outlived its agent process. Try to resurrect via a
-      // transient session/attach (hydra revives from loadFromDisk),
-      // and buffer the user's message so the new bridge picks it up
-      // when discovery's next poll catches the now-live session.
+      // Thread has no live bridge. Two reasons land here:
+      //   - cold session whose disk record outlived the agent process
+      //   - !session-created session whose first prompt hasn't promoted
+      //     it to interactive=true yet, so HydraDiscovery's default
+      //     /v1/sessions view filters it out
+      // Either way the marker on the thread parent carries the
+      // sessionId. Fetch the full session info from the daemon (with
+      // includeNonInteractive=true so the filter doesn't hide it), then
+      // adopt directly via the adopter so the bridge gets created
+      // without waiting for the next discovery poll.
       const sessionId = await findSessionIdForThread(
         app,
         m.channel,
@@ -226,14 +235,17 @@ export function createSlackApp(config: Config): SlackApp {
         return;
       }
       bufferPendingMessage(sessionId, { text, images: imageBlocks });
-      log.info(
-        `cold thread ${m.thread_ts} → buffer + resurrect ${sessionId.slice(0, 8)}`,
-      );
-      attemptResurrect(config, sessionId).catch((err: unknown) => {
+      const info = await fetchSessionInfo(config, sessionId);
+      if (!info) {
         log.warn(
-          `resurrect ${sessionId.slice(0, 8)} failed: ${(err as Error).message}`,
+          `orphan thread ${m.thread_ts}: session ${sessionId.slice(0, 8)} not in daemon /v1/sessions; dropping`,
         );
-      });
+        return;
+      }
+      log.info(
+        `orphan thread ${m.thread_ts} → adopt ${sessionId.slice(0, 8)}`,
+      );
+      adopterRef.current?.adopt(info);
       return;
     }
     // First candidate is the preferred one (most recent live activity);
@@ -787,6 +799,7 @@ async function tryLookupByMessage(
 async function handleSessionCommand(
   app: bolt.App,
   config: Config,
+  adopterRef: AdopterRef,
   rawText: string,
   channel: string,
   ts: string,
@@ -811,6 +824,16 @@ async function handleSessionCommand(
       images: [],
     });
   }
+  // Adopt immediately rather than waiting for the next HydraDiscovery
+  // poll. The daemon filters interactive=undefined sessions out of
+  // /v1/sessions by default, so discovery wouldn't see this one until
+  // the user's first prompt promotes it — opening the thread now keeps
+  // !session responsive AND survives that filter.
+  adopterRef.current?.adopt({
+    sessionId: result.sessionId,
+    cwd: result.cwd,
+    agentId: result.agentId,
+  });
   await app.client.reactions
     .add({ channel, timestamp: ts, name: "white_check_mark" })
     .catch(() => undefined);

@@ -2,8 +2,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AcpAttach } from "./acp/attach.js";
-import { SessionBridge } from "./acp/session.js";
 import {
   channelsFile,
   configPath,
@@ -13,21 +11,15 @@ import {
 } from "./config.js";
 import { HydraDiscovery } from "./hydra-discovery.js";
 import { createSlackApp } from "./slack/app.js";
-import { consumePendingMessages } from "./slack/resurrect.js";
+import { SessionAdopter, type AdopterRef, type AttachContext } from "./slack/adopter.js";
 import { ThreadClient } from "./slack/thread.js";
 import { ThreadJanitor } from "./slack/thread-janitor.js";
 import { ChannelMap } from "./storage/channels.js";
 import { HiddenStore } from "./storage/hidden.js";
 import { TruncatedStore } from "./storage/truncated.js";
-import { threadRegistry } from "./slack/registry.js";
 import { logger, setDebug } from "./util/log.js";
 
 const log = logger("main");
-
-interface AttachContext {
-  attach: AcpAttach;
-  bridge: SessionBridge;
-}
 
 function readVersion(): string {
   try {
@@ -78,7 +70,12 @@ async function main(): Promise<void> {
     `authorized users: ${config.authorizedUsers.size > 0 ? Array.from(config.authorizedUsers).join(",") + " (whitelist)" : "(empty — all Slack users allowed)"}`,
   );
 
-  const slack = createSlackApp(config);
+  // Adopter ref threaded through createSlackApp's message handlers so
+  // !session and the orphan-thread recovery path can drive the same
+  // adoption primitive as HydraDiscovery. Populated below once the
+  // real deps (thread, channels, stores, bridges) are constructed.
+  const adopterRef: AdopterRef = { current: null };
+  const slack = createSlackApp(config, adopterRef);
   await slack.start();
   const thread = new ThreadClient(slack.app);
   const channels = new ChannelMap(channelsFile());
@@ -100,59 +97,22 @@ async function main(): Promise<void> {
     }
   }, FLUSH_INTERVAL_MS);
 
+  const adopter = new SessionAdopter({
+    config,
+    thread,
+    channels,
+    truncatedStore,
+    hiddenStore,
+    bridges,
+  });
+  adopterRef.current = adopter;
+
   const discovery = new HydraDiscovery({
     daemonUrl: config.hydraDaemonUrl,
     token: config.hydraToken,
     pollIntervalMs: config.hydraPollIntervalMs,
     onAdd(session) {
-      const sessionId = session.sessionId;
-      log.info(
-        `session added: ${sessionId} agent=${session.agentId ?? "?"} cwd=${session.cwd}`,
-      );
-      const attach = new AcpAttach({
-        sessionId,
-        daemonWsUrl: config.hydraWsUrl,
-        token: config.hydraToken,
-      });
-      const initialMessages = consumePendingMessages(sessionId);
-      const bridge = new SessionBridge({
-        attach,
-        config,
-        thread,
-        channels,
-        truncatedStore,
-        hiddenStore,
-        sessionMeta: {
-          sessionId,
-          cwd: session.cwd,
-          title: session.title,
-          agentId: session.agentId,
-          importedFromMachine: session.importedFromMachine,
-          upstreamSessionId: session.upstreamSessionId,
-        },
-        initialMessages,
-      });
-      attach.on("close", () => {
-        // Run the bundle dump (if enabled) before tearing down so
-        // session state — channel, threadTs, sessionId — is still
-        // populated for the upload. cleanup() and unregister run in
-        // the .finally so they always happen even if upload errors.
-        void bridge
-          .uploadBundlesOnExit()
-          .catch((err: unknown) => {
-            log.warn(`bundle upload error: ${(err as Error).message}`);
-          })
-          .finally(() => {
-            bridge.cleanup();
-            threadRegistry.unregisterBridge(bridge);
-            bridges.delete(sessionId);
-          });
-      });
-      attach.on("error", (err) => {
-        log.warn(`attach error: ${err.message}`);
-      });
-      attach.start();
-      bridges.set(sessionId, { attach, bridge });
+      adopter.adopt(session);
     },
     onRemove(sessionId) {
       log.info(`session removed: ${sessionId}`);

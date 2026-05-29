@@ -71,6 +71,52 @@ export async function findSessionIdForThread(
   }
 }
 
+// Look up a specific session in the daemon's /v1/sessions view. Passes
+// includeNonInteractive=true so we find rows that haven't seen a
+// user prompt yet — orphan-thread recovery typically lands here, since
+// such sessions are filtered out of the default view.
+export async function fetchSessionInfo(
+  config: Config,
+  sessionId: string,
+): Promise<
+  | {
+      sessionId: string;
+      cwd: string;
+      title?: string;
+      agentId?: string;
+      importedFromMachine?: string;
+      upstreamSessionId?: string;
+    }
+  | undefined
+> {
+  try {
+    const r = await fetch(
+      `${config.hydraDaemonUrl}/v1/sessions?includeNonInteractive=true`,
+      {
+        headers: { Authorization: `Bearer ${config.hydraToken}` },
+      },
+    );
+    if (!r.ok) {
+      log.warn(`fetchSessionInfo: GET /v1/sessions returned ${r.status}`);
+      return undefined;
+    }
+    const body = (await r.json()) as {
+      sessions: Array<{
+        sessionId: string;
+        cwd: string;
+        title?: string;
+        agentId?: string;
+        importedFromMachine?: string;
+        upstreamSessionId?: string;
+      }>;
+    };
+    return body.sessions.find((s) => s.sessionId === sessionId);
+  } catch (err) {
+    log.warn(`fetchSessionInfo failed: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
 // Open a transient WS to hydra, run initialize + session/attach, close.
 // If the session is cold on disk, hydra runs loadFromDisk + resurrect to
 // bring it back live before responding to attach. Once the daemon's

@@ -10,9 +10,13 @@ etc.) running through hydra shows up in Slack:
 - Permission prompts surface as `:lock:` messages; ✅ / ❌ reactions
   approve or deny.
 - Slack-side messages flow back into the agent as user prompts.
+- New sessions can also be created directly from Slack with the
+  `!session` bang command (see [Slash-style commands](#slash-style-commands)).
 
-The bridge runs as a hydra extension (or standalone), polls hydra's
-REST API for active sessions, and attaches over WSS to each one.
+The bridge runs as a hydra extension (or standalone), watches hydra for
+active sessions, and attaches over WSS to each one. Sessions that the
+bot itself starts (via `!session`) get adopted immediately — no waiting
+for the next discovery poll.
 
 ## How it works
 
