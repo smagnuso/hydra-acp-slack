@@ -24,11 +24,6 @@ export interface HydraSessionInfo {
   originatingClient?: { name: string; version?: string };
 }
 
-// Sessions spawned by `hydra cat` self-identify with this clientInfo.name
-// on their initialize. They're typically one-shot CLI invocations and
-// shouldn't be mirrored to slack threads.
-const HYDRA_CAT_CLIENT_NAME = "hydra-acp-cat";
-
 export interface HydraDiscoveryOptions {
   daemonUrl: string;
   token: string;
@@ -82,12 +77,13 @@ export class HydraDiscovery {
         return;
       }
       const body = (await r.json()) as { sessions: HydraSessionInfo[] };
+      // The daemon's default `/v1/sessions` view already filters out
+      // non-interactive rows (cat one-shots, editor-spawned empty
+      // sessions). We just skip cold rows here — slack only mirrors
+      // live sessions.
       const seen = new Map<string, HydraSessionInfo>();
       for (const s of body.sessions) {
         if (s.status !== "live") {
-          continue;
-        }
-        if (s.originatingClient?.name === HYDRA_CAT_CLIENT_NAME) {
           continue;
         }
         seen.set(s.sessionId, s);
