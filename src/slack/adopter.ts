@@ -61,6 +61,10 @@ export class SessionAdopter {
       sessionId,
       daemonWsUrl: this.deps.config.hydraWsUrl,
       token: this.deps.config.hydraToken,
+      // Default attaches request snapshot-only history. Only when the
+      // operator opts into backfill do we pull the full conversation
+      // (and let the bridge post it into a fresh thread).
+      historyPolicy: this.deps.config.backfillHistory ? "full" : "pending_only",
     });
     const initialMessages = consumePendingMessages(sessionId);
     const bridge = new SessionBridge({

@@ -30,6 +30,12 @@ export interface AttachOptions {
   // Optional initialize/clientCapabilities; sent on connect.
   clientCapabilities?: Record<string, unknown>;
   protocolVersion?: number;
+  // historyPolicy for session/attach. Defaults to "pending_only": hydra
+  // replays only the current state snapshot (title/model/mode/usage/
+  // commands) and no conversation history, so the bridge never has to
+  // suppress a replay flood. Set to "full" only when the caller actually
+  // wants the whole conversation backfilled into the thread.
+  historyPolicy?: "full" | "pending_only" | "none" | "after_message";
 }
 
 export interface AttachEvents {
@@ -257,7 +263,7 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
         _meta?: Record<string, unknown>;
       }>("session/attach", {
         sessionId: this.opts.sessionId,
-        historyPolicy: "full",
+        historyPolicy: this.opts.historyPolicy ?? "pending_only",
         clientInfo: { name: "hydra-acp-slack", version: pkg.version },
       });
       this._attachMeta = attachResult._meta;

@@ -356,13 +356,14 @@ export interface SessionBridgeOptions {
 // each bridge owns one WS attach to /acp on hydra and renders that
 // session's traffic into a Slack thread.
 //
-// Replay handling: hydra replays cached history on attach. We don't
-// want each replayed event posting to Slack (rate limits, noise). The
-// bridge starts in `replay` mode where every frame resets a quiet
-// timer; once the timer fires (~2s of inbound silence) we flip to
-// `live` and start posting. Replayed events still build internal
-// state so we know about in-flight tool calls, we just don't surface
-// them.
+// History handling: the bridge attaches with historyPolicy
+// "pending_only" (see AcpAttach), so hydra sends only the current
+// state snapshot (title/model/mode/usage/commands) and zero
+// conversation history — there is nothing to suppress, and every
+// notification that arrives is genuinely live and gets surfaced. The
+// one exception is backfill mode (config.backfillHistory), where the
+// adopter attaches "full" precisely because the operator wants the
+// whole conversation posted into the thread.
 export class SessionBridge {
   private sessions = new Map<string, SessionState>();
   // While a session's thread is being opened, concurrent notifications
@@ -426,13 +427,6 @@ export class SessionBridge {
       suppressDelete?: boolean;
     }
   >();
-  // When backfillHistory is true, we surface every replayed event. When
-  // false (the default), we discard the proxy's history replay and only
-  // post Slack messages once the inbound stream has been quiet for
-  // `liveQuietMs`. See SessionBridge class doc.
-  private live: boolean;
-  private liveTimer: NodeJS.Timeout | undefined;
-
   // Texts of session/prompt requests we sent ourselves, kept around so
   // we can suppress the user_message_chunk that hydra fans back out to
   // all attached frontends (us included). FIFO per session; entries
@@ -451,7 +445,6 @@ export class SessionBridge {
   private notificationChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: SessionBridgeOptions) {
-    this.live = opts.config.backfillHistory;
     opts.attach.on("open", () => {
       // Open the Slack thread eagerly as soon as we attach to the hydra
       // session — before any agent activity — so Slack-side users can
@@ -483,7 +476,6 @@ export class SessionBridge {
         });
     });
     opts.attach.on("notification", (n) => {
-      this.bumpLiveTimer();
       this.notificationChain = this.notificationChain.then(() =>
         this.onNotification(n).catch((err: unknown) => {
           log.warn(`onNotification error: ${(err as Error).message}`);
@@ -491,25 +483,8 @@ export class SessionBridge {
       );
     });
     opts.attach.on("request", (r) => {
-      this.bumpLiveTimer();
       void this.onRequest(r);
     });
-    if (!this.live) {
-      this.bumpLiveTimer();
-    }
-  }
-
-  private bumpLiveTimer(): void {
-    if (this.live) {
-      return;
-    }
-    if (this.liveTimer) {
-      clearTimeout(this.liveTimer);
-    }
-    this.liveTimer = setTimeout(() => {
-      this.live = true;
-      log.info(`live: ${this.opts.attach.sessionId}`);
-    }, this.opts.config.liveQuietMs);
   }
 
   // Public so the inbound handlers can route by sessionId.
@@ -556,34 +531,13 @@ export class SessionBridge {
       }
     }
 
-    // available_commands_update is the one session/update kind we want
-    // to process during the replay window — it's a state snapshot that
-    // populates the routing map for `!<verb>` bangs, not an event that
-    // would re-render old transcript content. Handled out-of-band here
-    // before the live gate so a session whose commands update only ever
-    // arrives in replay (the common case for short-lived sessions)
-    // still gets a populated availableCommands map.
-    const earlySessionId = (params.sessionId ?? params.session_id) as
-      | string
-      | undefined;
-    if (
-      n.method === "session/update" &&
-      earlySessionId &&
-      isAvailableCommandsUpdate(params)
-    ) {
-      this.applyAvailableCommandsUpdate(earlySessionId, params);
-    }
-
     const sessionId = (params.sessionId ?? params.session_id) as
       | string
       | undefined;
 
-    // Queue lifecycle notifications are always live — the daemon never
-    // replays them in history. Process them regardless of this.live so
-    // that turns which start during the live-quiet window still get
-    // their currentHeadMessageId set (avoids "amend skip (no head)"
-    // when the bridge re-attaches to a session and misses the started
-    // event for the first buffered prompt).
+    // Queue lifecycle notifications are handled ahead of the session/
+    // update dispatch below because they carry their own method names,
+    // not a session/update envelope.
     if (n.method === "hydra-acp/prompt_queue_added" && sessionId) {
       log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueAdded(sessionId, params);
@@ -612,9 +566,6 @@ export class SessionBridge {
       return;
     }
 
-    if (!this.live) {
-      return; // drop replayed history; only act on live events
-    }
     log.debug(`notification ${n.method} sessionId=${sessionId ?? "(none)"}`);
 
     if (n.method === "session/update" && sessionId) {
@@ -660,13 +611,6 @@ export class SessionBridge {
     const params = (r.params ?? {}) as Record<string, unknown>;
     const sessionId = params.sessionId as string | undefined;
     log.debug(`request ${r.method} sessionId=${sessionId ?? "(none)"}`);
-
-    if (!this.live) {
-      // Replayed permission requests are stale (already resolved by the
-      // primary). Drop without responding — the proxy will route any
-      // live response through the request's original recipient.
-      return;
-    }
 
     if (r.method === "session/request_permission" && sessionId) {
       await this.handlePermissionRequest(r, sessionId, params);
@@ -891,9 +835,8 @@ export class SessionBridge {
       }
       case "available_commands_update":
         // Refresh the per-session command set so `!<verb>` routing knows
-        // what's valid. Live and replay paths both end up here, but the
-        // replay path runs out-of-band above the `!this.live` gate, so
-        // this case only fires for live events.
+        // what's valid. Arrives in the snapshot burst on attach and on
+        // any later live update.
         this.applyAvailableCommandsUpdate(sessionId, params);
         break;
       case "config_option_update":
@@ -3418,14 +3361,6 @@ export class SessionBridge {
       2,
     );
   }
-}
-
-// Quick predicate so the early-out path that peels off
-// available_commands_update from the live gate doesn't need to repeat
-// the type narrowing inline.
-function isAvailableCommandsUpdate(params: Record<string, unknown>): boolean {
-  const update = (params.update ?? {}) as { sessionUpdate?: unknown };
-  return update.sessionUpdate === "available_commands_update";
 }
 
 // Recognise Claude's ExitPlanMode tool across casing variants. The wire
