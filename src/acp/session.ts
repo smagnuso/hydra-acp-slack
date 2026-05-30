@@ -1822,38 +1822,46 @@ export class SessionBridge {
         // Only fires if a queued indicator was actually posted (i.e.
         // the prompt waited for at least one other turn).
         ownEntry.started = true;
+        session.queueByMessageId.delete(messageId);
         if (ownEntry.promptTs) {
-          // Wait for the previous own turn's Ready marker to post
-          // before posting Processing for this one. The daemon
-          // dequeues the next prompt as soon as the previous turn
-          // resolves, so prompt_queue_removed{started} can arrive on
-          // notificationChain at the same tick as (or before) the
-          // session/prompt response continuation that schedules the
-          // previous turn's finalize tail. Without this barrier
-          // Processing visually precedes Ready in the thread.
+          // Post the Processing indicator only after the previous own
+          // turn's Ready marker lands, so Processing doesn't visually
+          // precede Ready in the thread.
+          //
+          // CRITICAL: this wait runs as a DETACHED continuation, not
+          // inline on the notificationChain. The barrier we wait on
+          // (the prior turn's waitForPriorReady) is resolved by that
+          // turn's own-turn-end finalize tail — which is itself
+          // scheduled on notificationChain. If we awaited it while
+          // occupying the chain, the tail could never run (it sits
+          // behind us on the same chain) and we'd deadlock: no Ready,
+          // no finalize, the queued prompt stays stuck "queued"
+          // forever. Detaching lets the chain drain so the prior
+          // tail runs and resolves the barrier.
           //
           // We wait on the *previous* turn's barrier (captured at
           // enqueue time onto waitForPriorReady), not the current
           // session.pendingOwnTurnEnd — that already points to our
           // own turn's barrier (installed by our sendUserPrompt) and
-          // awaiting it would deadlock the next-turn handler against
-          // its own finish.
-          if (ownEntry.waitForPriorReady) {
-            await ownEntry.waitForPriorReady.catch(() => undefined);
-          }
-          // Stash the new processing-indicator ts on the session so
-          // `:stop_sign:` reactions and the Block Kit Cancel button
-          // on it can route to session/cancel.
-          const processingTs = await this.markQueueIndicatorProcessing(
-            session,
-            ownEntry.promptTs,
-            ownEntry.text,
-          ).catch(() => undefined);
-          if (processingTs) {
-            session.processingTs = processingTs;
-          }
+          // awaiting it would block on our own finish.
+          const entry = ownEntry;
+          void (async () => {
+            if (entry.waitForPriorReady) {
+              await entry.waitForPriorReady.catch(() => undefined);
+            }
+            // Stash the new processing-indicator ts on the session so
+            // `:stop_sign:` reactions and the Block Kit Cancel button
+            // on it can route to session/cancel.
+            const processingTs = await this.markQueueIndicatorProcessing(
+              session,
+              entry.promptTs!,
+              entry.text,
+            ).catch(() => undefined);
+            if (processingTs) {
+              session.processingTs = processingTs;
+            }
+          })();
         }
-        session.queueByMessageId.delete(messageId);
       }
       return;
     }
