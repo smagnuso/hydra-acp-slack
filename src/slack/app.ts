@@ -458,7 +458,7 @@ export function createSlackApp(
   // button value carries {sessionId, promptTs}; promptTs is the ts of
   // the indicator the user clicked on, which the bridge uses to find
   // the right queued entry (own vs. peer) and fire
-  // hydra-acp/cancel_prompt. Equivalent to the :stop_sign: reaction
+  // hydra-acp/prompt/cancel. Equivalent to the :stop_sign: reaction
   // on the same indicator.
   app.action(
     { type: "block_actions", action_id: CANCEL_QUEUED_ACTION_ID },
@@ -505,7 +505,7 @@ export function createSlackApp(
 
   // Block Kit Amend button on a queued indicator. Same {sessionId,
   // promptTs} payload as Cancel; the bridge folds the queued text into
-  // the in-flight head turn via hydra-acp/amend_prompt and then drops
+  // the in-flight head turn via hydra-acp/prompt/amend and then drops
   // the queued entry.
   app.action(
     { type: "block_actions", action_id: AMEND_QUEUED_ACTION_ID },
@@ -953,7 +953,7 @@ type SlackMessageEnvelope = Partial<{
   };
 }>;
 
-// Slack edit of a previously-queued prompt → hydra-acp/update_prompt.
+// Slack edit of a previously-queued prompt → hydra-acp/prompt/update.
 // Only fires when:
 //   * the edited message lives in a bridged thread
 //   * there's an own queued entry stamped with this source ts
@@ -1029,7 +1029,7 @@ async function handleMessageChanged(
     });
 }
 
-// Slack delete of a previously-queued prompt → hydra-acp/cancel_prompt.
+// Slack delete of a previously-queued prompt → hydra-acp/prompt/cancel.
 // Symmetric with handleMessageChanged: same lookup, same skip rules,
 // just routed to the cancel primitive.
 async function handleMessageDeleted(

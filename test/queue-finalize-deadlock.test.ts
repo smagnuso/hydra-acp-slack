@@ -154,7 +154,7 @@ test("queued second prompt does not deadlock the first turn's finalize", async (
   const p1mid = "m_p1";
   attach.emit("notification", {
     jsonrpc: "2.0",
-    method: "hydra-acp/prompt_queue_added",
+    method: "hydra-acp/prompt_queue/added",
     params: {
       sessionId: SESSION_ID,
       messageId: p1mid,
@@ -164,7 +164,7 @@ test("queued second prompt does not deadlock the first turn's finalize", async (
   });
   attach.emit("notification", {
     jsonrpc: "2.0",
-    method: "hydra-acp/prompt_queue_removed",
+    method: "hydra-acp/prompt_queue/removed",
     params: { sessionId: SESSION_ID, messageId: p1mid, reason: "started" },
   });
   await flush();
@@ -178,7 +178,7 @@ test("queued second prompt does not deadlock the first turn's finalize", async (
   const p2mid = "m_p2";
   attach.emit("notification", {
     jsonrpc: "2.0",
-    method: "hydra-acp/prompt_queue_added",
+    method: "hydra-acp/prompt_queue/added",
     params: {
       sessionId: SESSION_ID,
       messageId: p2mid,
@@ -193,7 +193,7 @@ test("queued second prompt does not deadlock the first turn's finalize", async (
   // first; under the bug it blocks the chain awaiting p1's barrier.
   attach.emit("notification", {
     jsonrpc: "2.0",
-    method: "hydra-acp/prompt_queue_removed",
+    method: "hydra-acp/prompt_queue/removed",
     params: { sessionId: SESSION_ID, messageId: p2mid, reason: "started" },
   });
   await flush();

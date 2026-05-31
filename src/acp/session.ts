@@ -72,9 +72,9 @@ interface QueuedPromptEntry {
   promptTs: string | undefined;
   cancelled: boolean;
   started: boolean;
-  // Server-assigned id from hydra-acp/prompt_queue_added. Undefined
+  // Server-assigned id from hydra-acp/prompt_queue/added. Undefined
   // between the local enqueue and the daemon's accept; once bound,
-  // used as the target for hydra-acp/cancel_prompt (instead of local
+  // used as the target for hydra-acp/prompt/cancel (instead of local
   // chain splicing) so peers see the cancellation too, and as the key
   // for prompt_queue_updated to refresh the Slack indicator text when
   // another client edits this queued prompt.
@@ -181,7 +181,7 @@ interface SessionState {
   // resolves. Carries the Slack indicator's ts so :stop_sign:
   // reactions can target the right entry.
   queuedPrompts: QueuedPromptEntry[];
-  // messageId → queued entry for hydra-acp/prompt_queue_updated and
+  // messageId → queued entry for hydra-acp/prompt_queue/updated and
   // prompt_queue_removed notifications. Populated when a
   // prompt_queue_added with our originator binds to a FIFO-head
   // unbound entry in queuedPrompts. Lets cross-client edits / cancels
@@ -218,7 +218,7 @@ interface SessionState {
   // Populated by closeAgentMessage; cleared at turn end after synthesis.
   voiceTurnText: string;
   // messageIds of cancelled turns that were actually amendments.
-  // Populated by hydra-acp/prompt_amended (sent to all clients, no
+  // Populated by hydra-acp/prompt/amended (sent to all clients, no
   // exclusion). Checked in the sendUserPrompt response path so own
   // amended turns render as "amended" rather than "cancelled" (the
   // turn_complete notification is excluded for own-originated entries,
@@ -538,22 +538,22 @@ export class SessionBridge {
     // Queue lifecycle notifications are handled ahead of the session/
     // update dispatch below because they carry their own method names,
     // not a session/update envelope.
-    if (n.method === "hydra-acp/prompt_queue_added" && sessionId) {
+    if (n.method === "hydra-acp/prompt_queue/added" && sessionId) {
       log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueAdded(sessionId, params);
       return;
     }
-    if (n.method === "hydra-acp/prompt_queue_updated" && sessionId) {
+    if (n.method === "hydra-acp/prompt_queue/updated" && sessionId) {
       log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueUpdated(sessionId, params);
       return;
     }
-    if (n.method === "hydra-acp/prompt_queue_removed" && sessionId) {
+    if (n.method === "hydra-acp/prompt_queue/removed" && sessionId) {
       log.debug(`notification ${n.method} sessionId=${sessionId}`);
       await this.handlePromptQueueRemoved(sessionId, params);
       return;
     }
-    if (n.method === "hydra-acp/prompt_amended" && sessionId) {
+    if (n.method === "hydra-acp/prompt/amended" && sessionId) {
       log.debug(`notification ${n.method} sessionId=${sessionId}`);
       const cancelledMessageId =
         typeof params.cancelledMessageId === "string"
@@ -1553,7 +1553,7 @@ export class SessionBridge {
     return this.opts.config.slackChannelId ?? undefined;
   }
 
-  // hydra-acp/prompt_queue_added: hydra accepted a session/prompt and
+  // hydra-acp/prompt_queue/added: hydra accepted a session/prompt and
   // pushed it onto its per-session FIFO.
   //
   // Own-originator: bind the server's messageId to the FIFO head
@@ -1591,7 +1591,7 @@ export class SessionBridge {
           `queue-cancel pending->fire ${sessionId.slice(0, 8)} mid=${messageId.slice(0, 8)}`,
         );
         void this.opts.attach
-          .request("hydra-acp/cancel_prompt", {
+          .request("hydra-acp/prompt/cancel", {
             sessionId,
             messageId,
           })
@@ -1622,7 +1622,7 @@ export class SessionBridge {
           });
         }
         void this.opts.attach
-          .request("hydra-acp/update_prompt", {
+          .request("hydra-acp/prompt/update", {
             sessionId,
             messageId,
             prompt,
@@ -1707,8 +1707,8 @@ export class SessionBridge {
     });
   }
 
-  // hydra-acp/prompt_queue_updated: another client (or us) called
-  // hydra-acp/update_prompt to rewrite a queued prompt's content.
+  // hydra-acp/prompt_queue/updated: another client (or us) called
+  // hydra-acp/prompt/update to rewrite a queued prompt's content.
   // Refresh the Slack indicator text to reflect the new prompt — both
   // for our own queued entries (cross-client edits reach us) and as a
   // general consistency check when peers edit prompts that happen to
@@ -1777,7 +1777,7 @@ export class SessionBridge {
     }
   }
 
-  // hydra-acp/prompt_queue_removed: a queued entry left the queue.
+  // hydra-acp/prompt_queue/removed: a queued entry left the queue.
   // reason = "started" lines up with the local chain's
   // markQueueIndicatorProcessing path (no extra work needed — the
   // local chain owns that transition for own-prompts). reason =
@@ -2291,7 +2291,7 @@ export class SessionBridge {
 
     // Track this entry locally for the lifetime of the round-trip.
     // promptTs gets stashed when the queued indicator post resolves.
-    // messageId gets bound when hydra-acp/prompt_queue_added arrives.
+    // messageId gets bound when hydra-acp/prompt_queue/added arrives.
     // started flips true when prompt_queue_removed{started} fires —
     // used by :stop_sign: handler to know whether the cancel still has
     // a queue slot to drop or needs a session/cancel.
@@ -2451,7 +2451,7 @@ export class SessionBridge {
     // fresh Working (with a now-meaningless Cancel button) before the
     // periodic flusher gets around to posting the agent text.
     //
-    // hydra-acp/prompt_amended arrives as a separate WS message after
+    // hydra-acp/prompt/amended arrives as a separate WS message after
     // the session/prompt response even though the daemon sends them in
     // order — separate I/O events mean the response's microtask runs
     // before the notification's I/O event fires. By the time the tail
@@ -2491,7 +2491,7 @@ export class SessionBridge {
   }
 
   // Slack message_changed of a previously-queued prompt: route the new
-  // text through hydra-acp/update_prompt so the queued entry's prompt
+  // text through hydra-acp/prompt/update so the queued entry's prompt
   // gets rewritten before it runs. Lookup is keyed by the user's
   // original Slack `ts` (the message they edited), stamped onto the
   // entry at enqueue time. Mirrors the daemon-side updateQueuedPrompt
@@ -2540,7 +2540,7 @@ export class SessionBridge {
       prompt.push({ type: img.type, mimeType: img.mimeType, data: img.data });
     }
     void this.opts.attach
-      .request("hydra-acp/update_prompt", {
+      .request("hydra-acp/prompt/update", {
         sessionId,
         messageId: entry.messageId,
         prompt,
@@ -2553,7 +2553,7 @@ export class SessionBridge {
   }
 
   // Slack message_deleted of a previously-queued prompt: route to
-  // hydra-acp/cancel_prompt so the entry is dropped from the daemon's
+  // hydra-acp/prompt/cancel so the entry is dropped from the daemon's
   // queue before it runs. Symmetric with the `:stop_sign:`-reaction
   // cancel path at handleReaction's queued branch — same wire call,
   // just a different Slack-side trigger.
@@ -2591,7 +2591,7 @@ export class SessionBridge {
       `queue-cancel <- slack-delete ${sessionId.slice(0, 8)} mid=${entry.messageId.slice(0, 8)}: ${entry.text.slice(0, 80)}`,
     );
     void this.opts.attach
-      .request("hydra-acp/cancel_prompt", {
+      .request("hydra-acp/prompt/cancel", {
         sessionId,
         messageId: entry.messageId,
       })
@@ -2625,7 +2625,7 @@ export class SessionBridge {
   // Returns true if it matched and the cancel was issued; false if no
   // such entry exists (so a caller can try the next indicator kind).
   // Mirrors the previous reaction-cancel branch verbatim — same wire
-  // call (`hydra-acp/cancel_prompt`), same indicator update, same
+  // call (`hydra-acp/prompt/cancel`), same indicator update, same
   // optimistic local mark. Shared between the reaction path and the
   // Block Kit Cancel button handler.
   private async cancelOwnQueuedByPromptTs(
@@ -2650,7 +2650,7 @@ export class SessionBridge {
     // client (including us) to tear down their indicators.
     if (queued.messageId) {
       void this.opts.attach
-        .request("hydra-acp/cancel_prompt", {
+        .request("hydra-acp/prompt/cancel", {
           sessionId: session.sessionId,
           messageId: queued.messageId,
         })
@@ -2682,7 +2682,7 @@ export class SessionBridge {
           `peer queue-cancel <- slack ${session.sessionId.slice(0, 8)}: ${peer.text.slice(0, 80)}`,
         );
         void this.opts.attach
-          .request("hydra-acp/cancel_prompt", {
+          .request("hydra-acp/prompt/cancel", {
             sessionId: session.sessionId,
             messageId: peer.messageId,
           })
@@ -2724,7 +2724,7 @@ export class SessionBridge {
 
   // Public entry point for the Block Kit "Amend" button on a queued
   // indicator. Locates the queued entry (own or peer) by its
-  // indicator's Slack ts, fires hydra-acp/amend_prompt with the
+  // indicator's Slack ts, fires hydra-acp/prompt/amend with the
   // current in-flight head as the target, then cancels the queued
   // entry so it doesn't also run. Returns true when an entry matched.
   async amendQueuedByPromptTs(
@@ -2787,7 +2787,7 @@ export class SessionBridge {
       const result = await this.opts.attach.request<{
         amended?: boolean;
         reason?: string;
-      }>("hydra-acp/amend_prompt", {
+      }>("hydra-acp/prompt/amend", {
         sessionId,
         targetMessageId: headMessageId,
         prompt,
@@ -2813,7 +2813,7 @@ export class SessionBridge {
     // to "amended" rather than "cancelled".
     if (queuedMessageId) {
       void this.opts.attach
-        .request("hydra-acp/cancel_prompt", {
+        .request("hydra-acp/prompt/cancel", {
           sessionId,
           messageId: queuedMessageId,
         })
@@ -4154,7 +4154,7 @@ function buildCancelQueuedButton(
 
 // Build the "Amend" button paired with Cancel on a queued indicator.
 // Click flow: cancel this queued entry, fold its text into the
-// in-flight head turn via hydra-acp/amend_prompt. Same {s, p} payload
+// in-flight head turn via hydra-acp/prompt/amend. Same {s, p} payload
 // as Cancel — the action_id discriminates server-side.
 function buildAmendQueuedButton(
   sessionId: string,

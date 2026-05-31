@@ -62,7 +62,7 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
   private _attachMeta: Record<string, unknown> | undefined;
   private _attachModels: { currentModelId?: string } | undefined;
   // clientId hydra assigned us on session/attach. Lets the bridge
-  // recognize its own hydra-acp/prompt_queue_added events (so peer-
+  // recognize its own hydra-acp/prompt_queue/added events (so peer-
   // originated queue events don't trigger local-entry binding).
   private _clientId: string | undefined;
 
