@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
+  buildPermissionDetailLines,
   buildPermissionMessage,
   decodePermissionButtonValue,
   encodePermissionButtonValue,
@@ -84,6 +85,56 @@ test("buildPermissionMessage caps the actions block at 5 buttons and surfaces ov
   assert.ok(context, "overflow context block should be present");
   assert.match(context!.elements[0]!.text, /Option 5/);
   assert.match(context!.elements[0]!.text, /Option 6/);
+});
+
+test("buildPermissionDetailLines surfaces edit path + kind from locations/rawInput", () => {
+  const lines = buildPermissionDetailLines({
+    kind: "edit",
+    rawInput: { file_path: "/repo/src/a.ts" },
+    locations: [{ path: "/repo/src/a.ts" }],
+  });
+  assert.ok(lines.some((l) => /kind:.*`edit`/.test(l)));
+  assert.ok(lines.some((l) => /path:.*`\/repo\/src\/a\.ts`/.test(l)));
+  // De-duped: the same path in locations + rawInput shows once.
+  const pathHits = lines.filter((l) => l.includes("/repo/src/a.ts")).length;
+  assert.equal(pathHits, 1);
+});
+
+test("buildPermissionDetailLines surfaces execute command + description", () => {
+  const lines = buildPermissionDetailLines({
+    kind: "execute",
+    rawInput: { command: "git status", description: "Check repo state" },
+  });
+  assert.ok(lines.some((l) => /command:.*`git status`/.test(l)));
+  assert.ok(lines.some((l) => /Check repo state/.test(l)));
+});
+
+test("buildPermissionDetailLines clips very long values", () => {
+  const lines = buildPermissionDetailLines({
+    rawInput: { command: "x".repeat(5000) },
+  });
+  const cmd = lines.find((l) => l.includes("command"));
+  assert.ok(cmd && cmd.length < 500, "long command should be clipped");
+});
+
+test("buildPermissionDetailLines returns [] for an empty toolCall", () => {
+  assert.deepEqual(buildPermissionDetailLines(undefined), []);
+  assert.deepEqual(buildPermissionDetailLines({}), []);
+});
+
+test("buildPermissionMessage adds a detail context block when toolCall is rich", () => {
+  const { blocks } = buildPermissionMessage(
+    SESSION,
+    TOOL,
+    "external_directory",
+    [{ optionId: "o", name: "Allow", kind: "allow_once" }],
+    { kind: "edit", rawInput: { file_path: "/repo/x.ts" } },
+  );
+  const context = blocks.find((b) => b.type === "context") as
+    | { elements: Array<{ text: string }> }
+    | undefined;
+  assert.ok(context, "detail context block should be present");
+  assert.match(context!.elements[0]!.text, /\/repo\/x\.ts/);
 });
 
 test("decodePermissionButtonValue rejects junk", () => {

@@ -937,6 +937,7 @@ export class SessionBridge {
       toolCallId,
       title,
       options,
+      toolCall,
     );
 
     const promptTs = await this.postOrAccumulate(session, text, blocks);
@@ -3830,6 +3831,81 @@ export function decodePermissionButtonValue(
   }
 }
 
+// Pull the human-relevant context out of an ACP toolCall (kind, the
+// file/dir paths it touches, the shell command, the fetch URL, a short
+// description) and render each as a Slack context line. Agents populate
+// these fields inconsistently, so every line is best-effort; an empty
+// array means "nothing beyond the title worth showing". Kept local to
+// the slack package so it stays independent of the cli helpers.
+export function buildPermissionDetailLines(
+  toolCall: Record<string, unknown> | undefined,
+): string[] {
+  if (!toolCall) {
+    return [];
+  }
+  // Slack caps a context element's text at ~3000 chars; keep individual
+  // values well under that so one long command/path can't blow the block.
+  const MAX = 400;
+  const clip = (s: string): string =>
+    s.length <= MAX ? s : s.slice(0, MAX - 1) + "…";
+  const asStr = (v: unknown): string | undefined =>
+    typeof v === "string" && v.length > 0 ? clip(v) : undefined;
+  const lines: string[] = [];
+
+  const kind = asStr(toolCall.kind);
+  if (kind) {
+    lines.push(`*kind:* \`${kind}\``);
+  }
+
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  const addPath = (v: unknown): void => {
+    const s = asStr(v);
+    if (s && !seen.has(s)) {
+      seen.add(s);
+      paths.push(s);
+    }
+  };
+  if (Array.isArray(toolCall.locations)) {
+    for (const loc of toolCall.locations) {
+      if (loc && typeof loc === "object") {
+        addPath((loc as Record<string, unknown>).path);
+      }
+    }
+  }
+  const rawInput =
+    toolCall.rawInput && typeof toolCall.rawInput === "object"
+      ? (toolCall.rawInput as Record<string, unknown>)
+      : undefined;
+  if (rawInput) {
+    addPath(rawInput.file_path);
+    addPath(rawInput.filePath);
+    addPath(rawInput.path);
+  }
+  if (paths.length === 1) {
+    lines.push(`*path:* \`${paths[0]}\``);
+  } else if (paths.length > 1) {
+    lines.push(`*paths:*\n${paths.map((p) => `• \`${p}\``).join("\n")}`);
+  }
+
+  if (rawInput) {
+    const command = asStr(rawInput.command);
+    if (command) {
+      lines.push(`*command:* \`${command}\``);
+    }
+    const url = asStr(rawInput.url);
+    if (url) {
+      lines.push(`*url:* ${url}`);
+    }
+    const description = asStr(rawInput.description);
+    if (description) {
+      lines.push(`_${description}_`);
+    }
+  }
+
+  return lines;
+}
+
 // Construct the text fallback + Block Kit payload for a permission
 // prompt. `text` is what notifications and accessibility readers see;
 // the visible UI is the section header + actions row of buttons.
@@ -3843,6 +3919,7 @@ export function buildPermissionMessage(
   toolCallId: string,
   title: string,
   options: ReadonlyArray<{ optionId: string; name: string; kind?: string }>,
+  toolCall?: Record<string, unknown>,
 ): { text: string; blocks: SlackBlock[] } {
   const text = `:lock: Permission requested — ${title}`;
   const blocks: SlackBlock[] = [
@@ -3851,6 +3928,18 @@ export function buildPermissionMessage(
       text: { type: "mrkdwn", text: `:lock: *Permission requested*\n${title}` },
     },
   ];
+
+  // Surface what's actually being accessed (path / command / url) under
+  // the title so the human isn't approving a bare label like
+  // "external_directory". Agents populate these inconsistently, so the
+  // lines are best-effort and omitted entirely when empty.
+  const detailLines = buildPermissionDetailLines(toolCall);
+  if (detailLines.length > 0) {
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: detailLines.join("\n") }],
+    });
+  }
 
   const buttonOptions = options.slice(0, 5);
   const overflow = options.slice(5);
