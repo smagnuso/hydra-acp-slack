@@ -589,21 +589,23 @@ export class SessionBridge {
     if (!session.threadTs) {
       return;
     }
+    const parentOpts = {
+      title: session.title,
+      cwd: session.cwd,
+      sessionId: session.sessionId,
+      agentName: session.agentId ?? this.opts.attach.agentInfo?.name,
+      modelId: session.modelId,
+      modeId: session.modeId,
+      contextUsed: session.contextUsed,
+      contextSize: session.contextSize,
+      costAmount: session.costAmount,
+      costCurrency: session.costCurrency,
+    };
     await this.opts.thread.updateMessage(
       session.channel,
       session.threadTs,
-      renderParent({
-        title: session.title,
-        cwd: session.cwd,
-        sessionId: session.sessionId,
-        agentName: session.agentId ?? this.opts.attach.agentInfo?.name,
-        modelId: session.modelId,
-        modeId: session.modeId,
-        contextUsed: session.contextUsed,
-        contextSize: session.contextSize,
-        costAmount: session.costAmount,
-        costCurrency: session.costCurrency,
-      }),
+      renderParent(parentOpts),
+      renderParentBlocks(parentOpts),
     );
   }
 
@@ -1450,7 +1452,7 @@ export class SessionBridge {
       // is published into the sessions map. Otherwise concurrent
       // notifications would race in, see a session-with-no-threadTs, and
       // post unthreaded.
-      const initial = renderParent({
+      const initialOpts = {
         title: known.title,
         cwd,
         sessionId,
@@ -1461,10 +1463,11 @@ export class SessionBridge {
         contextSize: undefined,
         costAmount: undefined,
         costCurrency: undefined,
-      });
+      };
       const r = await this.opts.thread.postMessage({
         channel,
-        text: initial,
+        text: renderParent(initialOpts),
+        blocks: renderParentBlocks(initialOpts),
       });
       threadTs = r.threadTs;
       log.info(
@@ -1949,21 +1952,23 @@ export class SessionBridge {
     if (!session.threadTs) {
       return;
     }
+    const parentOpts = {
+      title,
+      cwd: session.cwd,
+      sessionId,
+      agentName: session.agentId ?? this.opts.attach.agentInfo?.name,
+      modelId: session.modelId,
+      modeId: session.modeId,
+      contextUsed: session.contextUsed,
+      contextSize: session.contextSize,
+      costAmount: session.costAmount,
+      costCurrency: session.costCurrency,
+    };
     await this.opts.thread.updateMessage(
       session.channel,
       session.threadTs,
-      renderParent({
-        title,
-        cwd: session.cwd,
-        sessionId,
-        agentName: session.agentId ?? this.opts.attach.agentInfo?.name,
-        modelId: session.modelId,
-        modeId: session.modeId,
-        contextUsed: session.contextUsed,
-        contextSize: session.contextSize,
-        costAmount: session.costAmount,
-        costCurrency: session.costCurrency,
-      }),
+      renderParent(parentOpts),
+      renderParentBlocks(parentOpts),
     );
   }
 
@@ -3499,7 +3504,7 @@ export function stripCommandArgsHint(raw: string): {
 //      mrkdwn doesn't support color).
 //   3. Session marker (italic, contains the full sessionId for the
 //      grep-based reattach path).
-function renderParent(opts: {
+interface ParentOpts {
   title: string | undefined;
   cwd: string | undefined;
   sessionId: string;
@@ -3510,39 +3515,76 @@ function renderParent(opts: {
   contextSize: number | undefined;
   costAmount: number | undefined;
   costCurrency: string | undefined;
-}): string {
-  const heading =
-    opts.title ?? (opts.cwd ? basename(opts.cwd) : undefined);
-  const lines: string[] = [];
-  if (heading) {
-    lines.push(`:robot_face: *${heading}*`);
-  }
-  const tailParts: string[] = [];
+}
+
+function parentHeading(opts: ParentOpts): string | undefined {
+  return opts.title ?? (opts.cwd ? basename(opts.cwd) : undefined);
+}
+
+// Build the metadata cells (cwd, agent•model, mode, cost, context, host)
+// shared by the plain-text and Block Kit renderers. The sessionMarker is
+// rendered separately (its own line) so it reads as a distinct footer.
+function parentMetaCells(opts: ParentOpts): string[] {
+  const cells: string[] = [];
   if (opts.cwd) {
-    tailParts.push(`_${opts.cwd}_ on \`${daemonHost}\``);
-  } else {
-    tailParts.push(`on \`${daemonHost}\``);
+    cells.push(`\`${opts.cwd}\``);
   }
-  const agent = friendlyAgent(opts.agentName);
-  const agentCell = agentWithModel(agent, opts.modelId);
+  const agentCell = agentWithModel(friendlyAgent(opts.agentName), opts.modelId);
   if (agentCell) {
-    tailParts.push(`\`${agentCell}\``);
+    cells.push(`with \`${agentCell}\``);
   }
   if (opts.modeId) {
-    tailParts.push(`mode \`${opts.modeId}\``);
+    cells.push(`mode \`${opts.modeId}\``);
+  }
+  if (typeof opts.costAmount === "number") {
+    const cur = opts.costCurrency ?? "USD";
+    cells.push(`cost \`${formatCost(opts.costAmount, cur)}\``);
   }
   if (typeof opts.contextUsed === "number" || typeof opts.contextSize === "number") {
     const used = formatTokens(opts.contextUsed);
     const size = formatTokens(opts.contextSize);
-    tailParts.push(`\`${used}\`/\`${size}\``);
+    cells.push(`ctx \`${used}\`/\`${size}\``);
   }
-  if (typeof opts.costAmount === "number") {
-    const cur = opts.costCurrency ?? "USD";
-    tailParts.push(`\`${formatCost(opts.costAmount, cur)}\``);
+  cells.push(`on \`${daemonHost}\``);
+  return cells;
+}
+
+// Plain-text rendering of the thread parent. Used as the `text:` field on
+// every parent message — kept verbatim so findSessionThread can grep the
+// sessionMarker even when Block Kit drives the visible rendering.
+function renderParent(opts: ParentOpts): string {
+  const heading = parentHeading(opts);
+  const lines: string[] = [];
+  if (heading) {
+    lines.push(`*${heading}*`);
   }
-  tailParts.push(sessionMarker(opts.sessionId));
-  lines.push(tailParts.join(" "));
+  lines.push(parentMetaCells(opts).join(" "));
+  lines.push(sessionMarker(opts.sessionId));
   return lines.join("\n");
+}
+
+// Block Kit rendering of the thread parent: a prominent `section` title
+// over a muted, smaller `context` line of metadata (cells joined with a
+// middot). Slack renders context blocks in subdued gray — a cleaner,
+// more app-like header than the packed mrkdwn line.
+function renderParentBlocks(opts: ParentOpts): SlackBlock[] {
+  const heading = parentHeading(opts);
+  const blocks: SlackBlock[] = [];
+  if (heading) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*${heading}*` },
+    });
+  }
+  blocks.push({
+    type: "context",
+    elements: [{ type: "mrkdwn", text: parentMetaCells(opts).join(" ") }],
+  });
+  blocks.push({
+    type: "context",
+    elements: [{ type: "mrkdwn", text: sessionMarker(opts.sessionId) }],
+  });
+  return blocks;
 }
 
 const daemonHost = hostname().split(".")[0] ?? hostname();
