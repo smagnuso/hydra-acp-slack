@@ -265,6 +265,13 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
         sessionId: this.opts.sessionId,
         historyPolicy: this.opts.historyPolicy ?? "pending_only",
         clientInfo: { name: "hydra-acp-slack", version: pkg.version },
+        // Slack never renders diff/output bodies, so request the lean
+        // ref-form tool content. It's a no-op for the default
+        // "pending_only" attach (no history replayed) and trims the
+        // replayed tool bodies we'd otherwise discard in backfill mode.
+        // Live broadcasts are unaffected (always full); the diff `path`
+        // stays inline either way, so notifications still work.
+        _meta: { "hydra-acp": { toolContent: "references" } },
       });
       this._attachMeta = attachResult._meta;
       this._attachModels = attachResult.models;
