@@ -45,7 +45,7 @@ forwarded back via `session/prompt`.
 
 ```sh
 npx @hydra-acp/slack setup
-# or, after installing globally: hydra-acp-slack setup
+# or, after installing globally: hydra-acp slack setup
 ```
 
 The wizard creates a Slack app from the manifest in this repo, runs the
@@ -55,7 +55,7 @@ lets you pick a channel from the ones the bot has been invited to, and
 writes `~/.hydra-acp/slack.conf` with mode `600`. About 3–5 minutes;
 two browser visits.
 
-Re-run `hydra-acp-slack setup` any time to sync the deployed Slack app's
+Re-run `hydra-acp slack setup` any time to sync the deployed Slack app's
 manifest with whatever's in this repo — useful when scopes or events
 change in a release.
 
@@ -139,10 +139,10 @@ warning so a typo doesn't blow away routing for active sessions.
 From npm (recommended):
 
 ```sh
-npm install -g @hydra-acp/slack
+npm install -g @hydra-acp/cli @hydra-acp/slack
 ```
 
-This drops an `hydra-acp-slack` binary on your PATH.
+This drops the `hydra-acp` (and `hydra`) CLI plus an `hydra-acp-slack` binary on your PATH. The CLI dispatches `hydra-acp <name>` to any `hydra-acp-<name>` binary on PATH, so the slack bridge is also reachable as `hydra-acp slack`.
 
 Or from source:
 
