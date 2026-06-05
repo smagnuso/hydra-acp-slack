@@ -307,6 +307,10 @@ async function step4AppLevelToken(appId: string): Promise<string> {
   info("  3. Name it 'socket', add scope: connections:write, click Generate");
   info("  4. Copy the xapp- token");
   blank();
+  info("  Optional: while you're in the app config, click 'App Home' in the");
+  info("  sidebar and enable 'Allow users to send Slash commands and messages");
+  info("  from the messages tab' if you want to DM the bot directly.");
+  blank();
   await pause("Press Enter to open the app page...");
   openBrowser(`https://api.slack.com/apps/${appId}/general`);
   blank();
