@@ -1,4 +1,4 @@
-import { convertMarkdownTables, hasGfmTable } from "./tables.js";
+import { convertMarkdownTables, hasGfmTable, unwrapFencedTables } from "./tables.js";
 
 // Best-effort markdown → Slack mrkdwn. Slack's flavor:
 //   *bold*, _italic_, ~strike~, `code`, ```fence```, > quote, * bullets.
@@ -73,7 +73,7 @@ const FENCE_INFO_RE = /```([^\s`]+)[ \t]*\n/;
 // Returns null when no trigger fires — caller stays on the text /
 // mrkdwn path.
 export function buildHighlightBlocks(raw: string): SlackBlock[] | null {
-  const pre = transformOutsideFences(raw, wrapAsciiTables);
+  const pre = transformOutsideFences(unwrapFencedTables(raw), wrapAsciiTables);
   if (!FENCE_INFO_RE.test(pre) && !hasGfmTable(pre)) {
     return null;
   }

@@ -25,7 +25,7 @@ test("leaves text without tables unchanged", () => {
   assert.equal(convertMarkdownTables(input), input);
 });
 
-test("does not transform tables inside fenced code", () => {
+test("unwraps a GFM table that was wrapped in a code fence", () => {
   const input = [
     "outside",
     "```",
@@ -35,6 +35,34 @@ test("does not transform tables inside fenced code", () => {
     "```",
     "after",
   ].join("\n");
-  // The inner table should stay literal; output should match input.
+  const out = convertMarkdownTables(input);
+  // Fences around the table are stripped and replaced with the
+  // formatted code-fenced aligned block.
+  assert.match(out, /outside\n```\n\| name \| role \|/);
+  assert.match(out, /\| ada {2}\| eng {2}\|\n```\nafter/);
+});
+
+test("unwraps a fence opener glued to the first table row", () => {
+  const input = [
+    "intro",
+    "```| name | role |",
+    "|------|------|",
+    "| ada  | eng |",
+    "```",
+    "tail",
+  ].join("\n");
+  const out = convertMarkdownTables(input);
+  assert.match(out, /\| name \| role \|/);
+  assert.match(out, /\| ada {2}\| eng {2}\|/);
+  // No glued fence-and-pipe artifact survives.
+  assert.ok(!out.includes("```|"));
+});
+
+test("leaves non-table fenced blocks alone even when they contain pipes", () => {
+  const input = [
+    "```sh",
+    "echo a | wc -l",
+    "```",
+  ].join("\n");
   assert.equal(convertMarkdownTables(input), input);
 });

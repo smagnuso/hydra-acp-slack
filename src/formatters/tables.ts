@@ -11,6 +11,7 @@ export function convertMarkdownTables(text: string): string {
   if (!text.includes("|")) {
     return text;
   }
+  text = unwrapFencedTables(text);
   const lines = text.split("\n");
   const out: string[] = [];
   let inFence = false;
@@ -53,6 +54,7 @@ export function hasGfmTable(text: string): boolean {
   if (!text.includes("|")) {
     return false;
   }
+  text = unwrapFencedTables(text);
   const lines = text.split("\n");
   let inFence = false;
   for (let i = 0; i + 1 < lines.length; i++) {
@@ -72,6 +74,70 @@ export function hasGfmTable(text: string): boolean {
     }
   }
   return false;
+}
+
+// Models sometimes emit a GFM table wrapped in a code fence, and
+// sometimes glue the fence opener to the first table row on a single
+// line (```| col | col |). Either case kills GFM table rendering
+// everywhere — fenced content is literal, and the glued form doesn't
+// even parse as a fence cleanly. Strip the fences when the fenced
+// payload is *only* a GFM table (header + separator + rows, optionally
+// surrounded by blank lines). Leave all other fenced blocks alone so
+// real code samples that happen to contain pipes survive.
+export function unwrapFencedTables(text: string): string {
+  if (!text.includes("```")) {
+    return text;
+  }
+  // Split a fence opener that has table content glued to the same line.
+  //   ```| Concern | …  →  ```␤| Concern | …
+  const split: string[] = [];
+  for (const line of text.split("\n")) {
+    const m = /^(\s*```[^\s`|]*)[ \t]*(\|.*)$/.exec(line);
+    if (m) {
+      split.push(m[1] ?? "");
+      split.push(m[2] ?? "");
+    } else {
+      split.push(line);
+    }
+  }
+  const out: string[] = [];
+  let i = 0;
+  while (i < split.length) {
+    const line = split[i] ?? "";
+    if (/^\s*```[^\s`]*\s*$/.test(line)) {
+      let j = i + 1;
+      while (j < split.length && !/^\s*```\s*$/.test(split[j] ?? "")) {
+        j++;
+      }
+      if (j < split.length) {
+        const body = split.slice(i + 1, j);
+        let s = 0;
+        let e = body.length;
+        while (s < e && (body[s] ?? "").trim() === "") {
+          s++;
+        }
+        while (e > s && (body[e - 1] ?? "").trim() === "") {
+          e--;
+        }
+        const trimmed = body.slice(s, e);
+        if (
+          trimmed.length >= 2 &&
+          TABLE_LINE.test(trimmed[0] ?? "") &&
+          SEPARATOR_LINE.test(trimmed[1] ?? "") &&
+          trimmed.every((l) => TABLE_LINE.test(l))
+        ) {
+          for (const l of trimmed) {
+            out.push(l);
+          }
+          i = j + 1;
+          continue;
+        }
+      }
+    }
+    out.push(line);
+    i++;
+  }
+  return out.join("\n");
 }
 
 function parseRow(line: string): string[] {
