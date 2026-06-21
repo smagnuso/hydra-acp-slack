@@ -13,6 +13,7 @@ import {
 import { logger } from "../util/log.js";
 import {
   listAgents,
+  canonicalizeSlash,
   matchKnownCommand,
   parseBangCommand,
   parseSessionArgs,
@@ -234,7 +235,12 @@ export function createSlackApp(
         );
         return;
       }
-      bufferPendingMessage(sessionId, { text, images: imageBlocks });
+      const orphanBang = parseBangCommand(text);
+      bufferPendingMessage(sessionId, {
+        text,
+        images: imageBlocks,
+        ...(orphanBang ? { slashCandidate: orphanBang.slash } : {}),
+      });
       const info = await fetchSessionInfo(config, sessionId);
       if (!info) {
         log.warn(
@@ -284,7 +290,7 @@ export function createSlackApp(
         );
         return;
       }
-      forwardedText = bang.slash;
+      forwardedText = canonicalizeSlash(bang.slash, matched);
       const emoji = BANG_VERB_REACTIONS[matched] ?? "gear";
       await app.client.reactions
         .add({ channel: m.channel, timestamp: m.ts, name: emoji })
@@ -819,9 +825,11 @@ async function handleSessionCommand(
     return;
   }
   if (args.prompt) {
+    const sessionBang = parseBangCommand(args.prompt);
     bufferPendingMessage(result.sessionId, {
       text: args.prompt,
       images: [],
+      ...(sessionBang ? { slashCandidate: sessionBang.slash } : {}),
     });
   }
   // Adopt immediately rather than waiting for the next HydraDiscovery

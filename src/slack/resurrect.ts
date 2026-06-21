@@ -9,6 +9,12 @@ const log = logger("resurrect");
 export interface PendingMessage {
   text: string;
   images: ReadonlyArray<{ type: "image" | "audio"; mimeType: string; data: string }>;
+  // Parsed-bang slash form (e.g. `/hydra compact`) when the buffered
+  // text was a `!foo bar` bang. Resolved against the bridge's
+  // available_commands_update at replay time so cold-session
+  // resurrection still routes slash commands instead of forwarding
+  // them as plain user prompts. Undefined for non-bang text.
+  slashCandidate?: string;
 }
 
 // Messages waiting for their session's bridge to come up. Filled by

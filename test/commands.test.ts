@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
+  canonicalizeSlash,
   matchKnownCommand,
   parseBangCommand,
   parseSessionArgs,
@@ -171,4 +172,35 @@ test("matchKnownCommand: no match returns null", () => {
   // Prefix without a separator after it (would match a different verb)
   // doesn't count.
   assert.equal(matchKnownCommand("/hydra-title", known), null);
+});
+
+test("matchKnownCommand: case-insensitive verb match returns canonical name", () => {
+  const known = ["/hydra compact", "/hydra agent"];
+  assert.equal(matchKnownCommand("/Hydra compact", known), "/hydra compact");
+  assert.equal(matchKnownCommand("/HYDRA AGENT codex", known), "/hydra agent");
+});
+
+test("canonicalizeSlash: rewrites verb to canonical, preserves tail", () => {
+  assert.equal(
+    canonicalizeSlash("/Hydra compact", "/hydra compact"),
+    "/hydra compact",
+  );
+  assert.equal(
+    canonicalizeSlash("/HYDRA AGENT codex", "/hydra agent"),
+    "/hydra agent codex",
+  );
+});
+
+test("parseBangCommand: !Hydra compact routes through canonical /hydra compact", () => {
+  const bang = parseBangCommand("!Hydra compact");
+  assert.ok(bang);
+  const matched = matchKnownCommand(bang!.slash, ["/hydra compact"]);
+  assert.equal(matched, "/hydra compact");
+  assert.equal(canonicalizeSlash(bang!.slash, matched!), "/hydra compact");
+});
+
+test("parseBangCommand: local-bang detection is case-insensitive", () => {
+  assert.equal(parseBangCommand("!Debug foo"), null);
+  assert.equal(parseBangCommand("!Session ~/dev"), null);
+  assert.equal(parseBangCommand("!AGENTS"), null);
 });

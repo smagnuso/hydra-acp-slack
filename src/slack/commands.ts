@@ -172,7 +172,7 @@ export function parseBangCommand(text: string): BangCommand | null {
   }
   const space = rest.indexOf(" ");
   const leadVerb = space === -1 ? rest : rest.slice(0, space);
-  if (LOCAL_BANGS.has(leadVerb)) {
+  if (LOCAL_BANGS.has(leadVerb.toLowerCase())) {
     return null;
   }
   return { slash: `/${rest}`, leadVerb };
@@ -183,19 +183,40 @@ export function parseBangCommand(text: string): BangCommand | null {
 // matched name (e.g. "/hydra agent") so callers can render
 // per-command UX (reaction emoji, error messages); the forward text is
 // the original `slash`.
+//
+// Comparison is case-insensitive on the verb portion so users typing
+// `!Hydra compact` (slack autocaps the first letter) still route to
+// the lowercase canonical `/hydra compact`. The returned name is the
+// canonical lowercase form from `known` — callers should swap that in
+// for the slash prefix when forwarding so the daemon's own slash
+// dispatcher (also case-sensitive) sees the lowercase verb.
 export function matchKnownCommand(
   slash: string,
   known: Iterable<string>,
 ): string | null {
+  const slashLower = slash.toLowerCase();
   let best: string | null = null;
   for (const name of known) {
-    if (slash === name || slash.startsWith(name + " ")) {
+    const nameLower = name.toLowerCase();
+    if (slashLower === nameLower || slashLower.startsWith(nameLower + " ")) {
       if (best === null || name.length > best.length) {
         best = name;
       }
     }
   }
   return best;
+}
+
+// Rewrite the leading "verb" portion of `slash` to the canonical form
+// (`matched` from matchKnownCommand) while preserving any user-typed
+// tail args verbatim. Used by the bang router so the text forwarded to
+// the daemon's slash dispatcher is `/hydra compact STATUS` even if the
+// user typed `!Hydra compact STATUS`.
+export function canonicalizeSlash(slash: string, matched: string): string {
+  if (slash.length === matched.length) {
+    return matched;
+  }
+  return matched + slash.slice(matched.length);
 }
 
 export async function listAgents(config: Config): Promise<AgentEntry[]> {

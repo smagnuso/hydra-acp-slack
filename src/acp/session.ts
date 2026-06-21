@@ -15,6 +15,7 @@ import {
 } from "../formatters/tool-call.js";
 import type { ReactionAction } from "../slack/reaction-map.js";
 import { threadRegistry } from "../slack/registry.js";
+import { canonicalizeSlash, matchKnownCommand } from "../slack/commands.js";
 import type { PendingMessage } from "../slack/resurrect.js";
 import { ChannelMap } from "../storage/channels.js";
 import { HiddenStore } from "../storage/hidden.js";
@@ -461,7 +462,23 @@ export class SessionBridge {
           await this.hydrateQueueFromAttach(sessionId);
           for (const msg of this.opts.initialMessages ?? []) {
             try {
-              await this.sendUserPrompt(sessionId, msg.text, msg.images);
+              // Resolve buffered bang commands now that the bridge is up
+              // and available_commands_update has populated. Without this,
+              // a `!hydra compact` typed against a cold thread would
+              // resurrect the session and then forward as plain user
+              // text — the daemon's slash dispatcher only sees `/hydra`.
+              let replayText = msg.text;
+              if (msg.slashCandidate) {
+                const known = this.availableCommands(sessionId);
+                const matched = matchKnownCommand(
+                  msg.slashCandidate,
+                  known.keys(),
+                );
+                if (matched) {
+                  replayText = canonicalizeSlash(msg.slashCandidate, matched);
+                }
+              }
+              await this.sendUserPrompt(sessionId, replayText, msg.images);
             } catch (err) {
               log.warn(
                 `buffered prompt failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
