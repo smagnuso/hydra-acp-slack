@@ -353,7 +353,7 @@ export interface SessionBridgeOptions {
 }
 
 // One SessionBridge per hydra session. The discovery layer
-// (HydraDiscovery) creates a bridge for each live session it sees;
+// (HydraDiscovery) creates a bridge for each warm session it sees;
 // each bridge owns one WS attach to /acp on hydra and renders that
 // session's traffic into a Slack thread.
 //

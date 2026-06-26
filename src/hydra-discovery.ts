@@ -9,7 +9,7 @@ export interface HydraSessionInfo {
   title: string | undefined;
   attachedClients: number;
   updatedAt: string;
-  status: "live" | "cold";
+  status: "warm" | "cold";
   // Set when the session was created by an archiver import. Combined
   // with upstreamSessionId in the createSession check below: a session
   // is only "foreign" (skipped by slack) when it's imported AND has
@@ -80,10 +80,10 @@ export class HydraDiscovery {
       // The daemon's default `/v1/sessions` view already filters out
       // non-interactive rows (cat one-shots, editor-spawned empty
       // sessions). We just skip cold rows here — slack only mirrors
-      // live sessions.
+      // warm sessions.
       const seen = new Map<string, HydraSessionInfo>();
       for (const s of body.sessions) {
-        if (s.status !== "live") {
+        if (s.status !== "warm") {
           continue;
         }
         seen.set(s.sessionId, s);

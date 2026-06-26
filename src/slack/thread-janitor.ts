@@ -29,11 +29,11 @@ interface DaemonSessionListResponse {
 
 // Periodic janitor: scans known Slack channels for `_session <id>_`
 // thread-parent markers whose sessionId is missing from the daemon's
-// full session list (live + cold).
+// full session list (warm + cold).
 //
 // Delete mode: a candidate must miss two consecutive sweeps before
 // chat.delete fires, so a transient daemon read failure cannot
-// orphan-delete a live thread.
+// orphan-delete a warm thread.
 //
 // Dry-run mode (deleteEnabled === false): logs "would delete …" on
 // first detection so users see results promptly. Each (channel, ts)
@@ -182,7 +182,7 @@ export class ThreadJanitor {
       for (const c of candidates) {
         if (this.opts.deleteEnabled) {
           // Delete mode: two-sweep gate so a transient daemon read
-          // failure can't orphan-delete a live thread.
+          // failure can't orphan-delete a warm thread.
           if (!this.pendingDelete.has(c.key)) {
             log.info(
               `abandoned thread detected session=${c.sessionId} channel=${c.channel} ts=${c.threadTs} (will delete on next sweep)`,
