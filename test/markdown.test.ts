@@ -15,6 +15,39 @@ test("converts links", () => {
   assert.equal(toSlackMrkdwn("[ex](https://e.com)"), "<https://e.com|ex>");
 });
 
+test("hydra:// links fall back to code span when session unknown / no team domain cached", () => {
+  const result = toSlackMrkdwn("[Review session](hydra://sessions/abc123)");
+  assert.equal(result, "Review session (`hydra://sessions/abc123`)");
+});
+
+test("hydra:// with turn fragment and host prefix also fall back to code span", () => {
+  const result = toSlackMrkdwn("[Open](hydra://host:5514/sessions/xyz#turn-3)");
+  assert.equal(result, "Open (`hydra://sessions/xyz`)");
+});
+
+test("hydra:// links rewrite to Slack permalink when session + team known", async () => {
+  const { threadRegistry, setTeamDomain } = await import("../src/slack/registry.js");
+  setTeamDomain("myteam");
+  // Stub bridge — findBySession only inspects sessionId; other fields
+  // aren't touched by the formatter path.
+  threadRegistry.register({
+    bridge: {} as never,
+    sessionId: "hydra_session_perm42",
+    channel: "C123",
+    threadTs: "1700000000.123456",
+  });
+
+  const result = toSlackMrkdwn("[Review](hydra://sessions/hydra_session_perm42)");
+  assert.equal(
+    result,
+    "<https://myteam.slack.com/archives/C123/p1700000000123456?thread_ts=1700000000.123456&cid=C123|Review>",
+  );
+
+  // Reset for other tests.
+  setTeamDomain("");
+  threadRegistry.unregisterBridge({} as never);
+});
+
 test("converts headings", () => {
   assert.equal(toSlackMrkdwn("# Title\nbody"), "*Title*\nbody");
   assert.equal(toSlackMrkdwn("### sub"), "*sub*");

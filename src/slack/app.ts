@@ -21,7 +21,7 @@ import {
 } from "./commands.js";
 import { reactionAction } from "./reaction-map.js";
 import { transcribeAudio } from "../transcribe.js";
-import { threadRegistry } from "./registry.js";
+import { setTeamDomain, threadRegistry } from "./registry.js";
 import type { AdopterRef } from "./adopter.js";
 import {
   bufferPendingMessage,
@@ -656,6 +656,23 @@ export function createSlackApp(
           await new Promise<void>((resolve) => setTimeout(resolve, 10_000));
         }
       }
+      // Cache the team domain (e.g. "netflix" from
+      // https://netflix.slack.com/) so the markdown formatter can build
+      // permalink URLs for hydra://sessions/<id> links synchronously.
+      // Best-effort — failure just means those links render without a
+      // clickable URL. Fire-and-forget: don't block startup on it.
+      void app.client.auth.test().then((res) => {
+        const url = typeof res.url === "string" ? res.url : "";
+        const m = url.match(/^https?:\/\/([^./]+)\.slack\.com\/?/);
+        if (m) {
+          setTeamDomain(m[1]!);
+          log.info(`team domain cached: ${m[1]}`);
+        } else {
+          log.warn(`auth.test returned no parseable team URL: ${JSON.stringify(url)}`);
+        }
+      }).catch((err) => {
+        log.warn(`auth.test failed: ${(err as Error).message}`);
+      });
       if (stopping) {
         return;
       }

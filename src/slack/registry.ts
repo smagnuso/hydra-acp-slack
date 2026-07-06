@@ -1,5 +1,20 @@
 import type { SessionBridge } from "../acp/session.js";
 
+// Team-workspace domain (e.g. "netflix" from "netflix.slack.com"), cached
+// once at startup via auth.test. Consumed by permalinkForSession() to
+// build clickable https://<team>.slack.com/archives/<channel>/p<ts>
+// URLs synchronously in the markdown formatter. Undefined until the
+// startup handshake completes; callers must fall back gracefully.
+let teamDomain: string | undefined;
+
+export function setTeamDomain(domain: string): void {
+  teamDomain = domain;
+}
+
+export function getTeamDomain(): string | undefined {
+  return teamDomain;
+}
+
 // Slack handlers receive (channel, threadTs) but need a SessionBridge +
 // sessionId to act. SessionBridges register threads here when they open
 // them; handlers look them up.
@@ -143,3 +158,16 @@ class ThreadRegistry {
 }
 
 export const threadRegistry = new ThreadRegistry();
+
+// Build a Slack permalink URL for a session, if we have both the thread
+// mapping and the team domain cached. Format matches the shape Slack's
+// own `chat.getPermalink` API returns, so links look identical to those
+// copied from the Slack UI. Returns undefined when either piece is
+// missing — the caller should fall back to a non-clickable rendering.
+export function permalinkForSession(sessionId: string): string | undefined {
+  const entry = threadRegistry.findBySession(sessionId);
+  const domain = getTeamDomain();
+  if (!entry || !domain) return undefined;
+  const tsNoDot = entry.threadTs.replace(".", "");
+  return `https://${domain}.slack.com/archives/${entry.channel}/p${tsNoDot}?thread_ts=${entry.threadTs}&cid=${entry.channel}`;
+}

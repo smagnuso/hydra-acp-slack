@@ -1,3 +1,4 @@
+import { permalinkForSession } from "../slack/registry.js";
 import { convertMarkdownTables, hasGfmTable, unwrapFencedTables } from "./tables.js";
 
 // Best-effort markdown → Slack mrkdwn. Slack's flavor:
@@ -104,8 +105,23 @@ function transform(s: string): string {
   // **bold** -> *bold*  (and __bold__ -> *bold*)
   s = s.replace(/\*\*([^*\n]+?)\*\*/g, "*$1*");
   s = s.replace(/__([^_\n]+?)__/g, "*$1*");
-  // [text](url) -> <url|text>
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+  // [text](url) -> <url|text>. For hydra://sessions/<id>, look up the
+  // session in threadRegistry and rewrite to a Slack permalink URL when
+  // both the thread mapping and the team domain are known. Falls back
+  // to a code-span rendering when either piece is missing (unknown
+  // session, or startup handshake hasn't cached the team domain yet).
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, text: string, url: string) => {
+    const hydraMatch = url.match(/^hydra:\/\/(?:[^/\s]+\/)?sessions\/([A-Za-z0-9_-]+)(?:#turn-\d+)?$/);
+    if (hydraMatch) {
+      const sid = hydraMatch[1]!;
+      const permalink = permalinkForSession(sid);
+      if (permalink) {
+        return `<${permalink}|${text}>`;
+      }
+      return `${text} (\`hydra://sessions/${sid}\`)`;
+    }
+    return `<${url}|${text}>`;
+  });
   // # heading -> *heading*
   s = s.replace(/^(#{1,6})\s+(.+)$/gm, (_m, _hashes: string, body: string) => `*${body.trim()}*`);
   return s;
