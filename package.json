@@ -1,6 +1,6 @@
 {
   "name": "@hydra-acp/slack",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "description": "Bridge hydra-acp sessions to Slack threads.",
   "license": "MIT",
   "type": "module",
