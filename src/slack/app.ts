@@ -159,7 +159,7 @@ async function loadCatFile(
     return { ok: false, reason: "not a regular file" };
   }
   if (st.size > CAT_MAX_FILE_BYTES) {
-    return { ok: false, reason: `file too large (${st.size} B > ${CAT_MAX_FILE_BYTES} B cap)` };
+    return { ok: false, reason: `file too large (${formatBytes(st.size)} > ${formatBytes(CAT_MAX_FILE_BYTES)} cap)` };
   }
   let buf: Buffer;
   try {
@@ -175,6 +175,16 @@ async function loadCatFile(
   return { ok: true, chunks, totalBytes: buf.length, language: languageForPath(abs) };
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) {
+    return `${n} B`;
+  }
+  if (n < 1024 * 1024) {
+    return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  }
+  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
 function buildCatBlocks(
   chunks: string[],
   chunkIndex: number,
@@ -188,8 +198,8 @@ function buildCatBlocks(
   const total = chunks.length;
   const header =
     total === 1
-      ? `:page_facing_up: \`${displayPath}\` (${totalBytes} B)`
-      : `:page_facing_up: \`${displayPath}\` — chunk ${chunkIndex + 1}/${total} (${totalBytes} B total)`;
+      ? `:page_facing_up: \`${displayPath}\` (${formatBytes(totalBytes)})`
+      : `:page_facing_up: \`${displayPath}\` — chunk ${chunkIndex + 1}/${total} (${formatBytes(totalBytes)} total)`;
   const blocks: unknown[] = [
     { type: "context", elements: [{ type: "mrkdwn", text: header }] },
     { type: "markdown", text: "```" + lang + "\n" + chunk + "\n```" },
@@ -997,7 +1007,7 @@ export function createSlackApp(
           thread_ts: state.t,
           filename: basename(state.p),
           file: buf,
-          initial_comment: `:page_facing_up: \`${basename(state.p)}\` — full file (${buf.length} B)`,
+          initial_comment: `:page_facing_up: \`${basename(state.p)}\` — full file (${formatBytes(buf.length)})`,
         });
       } catch (err) {
         log.warn(`cat_show_all upload failed: ${(err as Error).message}; falling back to chunk-post`);
