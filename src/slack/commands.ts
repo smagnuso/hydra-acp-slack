@@ -143,7 +143,7 @@ export interface AgentEntry {
 // slash commands. Everything else matching `!<verb>` is treated as a
 // slash command (strict mirror: `!foo bar` → `/foo bar`) and routed
 // against the daemon's discovered command set.
-const LOCAL_BANGS = new Set(["debug", "session", "agents"]);
+const LOCAL_BANGS = new Set(["debug", "session", "agents", "cat"]);
 
 export interface BangCommand {
   // Strict-mirror slash form: `!foo bar` → `/foo bar`. Routing then looks

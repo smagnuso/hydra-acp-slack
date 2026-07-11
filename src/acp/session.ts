@@ -3304,6 +3304,10 @@ export class SessionBridge {
     return this.opts.thread.fetchText(channel, ts);
   }
 
+  sessionCwd(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.cwd;
+  }
+
   // Returns the live slash-command map for the session, name → description
   // (description optional). The set is reset on every
   // available_commands_update from the daemon; an empty map means the
@@ -4101,6 +4105,8 @@ export const CANCEL_QUEUED_ACTION_ID = "hydra-cancel-queued";
 export const AMEND_QUEUED_ACTION_ID = "hydra-amend-queued";
 export const CANCEL_TURN_ACTION_ID = "hydra-cancel-turn";
 export const SPINNER_DETAILS_ACTION_ID = "hydra-spinner-details";
+export const CAT_SHOW_MORE_ACTION_ID = "hydra-cat-show-more";
+export const CAT_SHOW_ALL_ACTION_ID = "hydra-cat-show-all";
 
 interface CancelQueuedButtonValue {
   s: string; // sessionId

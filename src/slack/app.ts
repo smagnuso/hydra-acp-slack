@@ -1,7 +1,12 @@
 import bolt from "@slack/bolt";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import type { Config } from "../config.js";
 import {
   AMEND_QUEUED_ACTION_ID,
+  CAT_SHOW_ALL_ACTION_ID,
+  CAT_SHOW_MORE_ACTION_ID,
   CANCEL_QUEUED_ACTION_ID,
   CANCEL_TURN_ACTION_ID,
   decodeCancelQueuedValue,
@@ -11,6 +16,7 @@ import {
   SPINNER_DETAILS_ACTION_ID,
 } from "../acp/session.js";
 import { logger } from "../util/log.js";
+import { languageForPath } from "./cat-lang.js";
 import {
   listAgents,
   canonicalizeSlash,
@@ -30,6 +36,264 @@ import {
 } from "./resurrect.js";
 
 const log = logger("slack");
+
+const CAT_MAX_FILE_BYTES = 512 * 1024;
+const CAT_CHUNK_BODY_CHARS = 11500;
+const CAT_BINARY_SCAN_BYTES = 8192;
+
+interface CatButtonState {
+  s: string;   // sessionId
+  c: string;   // channel
+  t: string;   // threadTs
+  p: string;   // absolute path (already realpath-resolved)
+  i: number;   // next chunk index to render
+  n: number;   // total chunks
+}
+
+function encodeCatState(state: CatButtonState): string {
+  const json = JSON.stringify(state);
+  return Buffer.from(json, "utf8").toString("base64");
+}
+
+function decodeCatState(value: string | undefined): CatButtonState | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const json = Buffer.from(value, "base64").toString("utf8");
+    const parsed = JSON.parse(json) as CatButtonState;
+    if (
+      typeof parsed.s !== "string" ||
+      typeof parsed.c !== "string" ||
+      typeof parsed.t !== "string" ||
+      typeof parsed.p !== "string" ||
+      typeof parsed.i !== "number" ||
+      typeof parsed.n !== "number"
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function splitIntoChunks(body: string): string[] {
+  if (body.length <= CAT_CHUNK_BODY_CHARS) {
+    return [body];
+  }
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < body.length) {
+    let end = Math.min(i + CAT_CHUNK_BODY_CHARS, body.length);
+    if (end < body.length) {
+      const lastNl = body.lastIndexOf("\n", end);
+      if (lastNl > i + CAT_CHUNK_BODY_CHARS / 2) {
+        end = lastNl + 1;
+      }
+    }
+    chunks.push(body.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+
+function containsBinary(buf: Buffer): boolean {
+  const n = Math.min(buf.length, CAT_BINARY_SCAN_BYTES);
+  for (let i = 0; i < n; i++) {
+    if (buf[i] === 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function resolveCatPath(
+  raw: string,
+  cwd: string,
+): Promise<{ ok: true; abs: string; display: string } | { ok: false; reason: string }> {
+  let input = raw.trim();
+  if (
+    (input.startsWith('"') && input.endsWith('"')) ||
+    (input.startsWith("'") && input.endsWith("'"))
+  ) {
+    input = input.slice(1, -1);
+  }
+  if (input.length === 0) {
+    return { ok: false, reason: "usage: !cat <path>" };
+  }
+  const wasAbsolute = isAbsolute(input) || input.startsWith("~");
+  let expanded = input;
+  if (expanded.startsWith("~")) {
+    expanded = join(homedir(), expanded.slice(1));
+  }
+  const joined = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+  let abs: string;
+  let cwdReal: string;
+  try {
+    abs = await realpath(joined);
+  } catch (err) {
+    return { ok: false, reason: `cannot resolve path: ${(err as Error).message}` };
+  }
+  try {
+    cwdReal = await realpath(cwd);
+  } catch {
+    cwdReal = cwd;
+  }
+  if (!wasAbsolute && !abs.startsWith(cwdReal + "/") && abs !== cwdReal) {
+    return { ok: false, reason: "path escapes session cwd" };
+  }
+  return { ok: true, abs, display: input };
+}
+
+async function loadCatFile(
+  abs: string,
+): Promise<{ ok: true; chunks: string[]; totalBytes: number; language: string | undefined } | { ok: false; reason: string }> {
+  let st;
+  try {
+    st = await stat(abs);
+  } catch (err) {
+    return { ok: false, reason: `stat failed: ${(err as Error).message}` };
+  }
+  if (!st.isFile()) {
+    return { ok: false, reason: "not a regular file" };
+  }
+  if (st.size > CAT_MAX_FILE_BYTES) {
+    return { ok: false, reason: `file too large (${st.size} B > ${CAT_MAX_FILE_BYTES} B cap)` };
+  }
+  let buf: Buffer;
+  try {
+    buf = await readFile(abs);
+  } catch (err) {
+    return { ok: false, reason: `read failed: ${(err as Error).message}` };
+  }
+  if (containsBinary(buf)) {
+    return { ok: false, reason: "looks like a binary file, refusing to cat" };
+  }
+  const text = buf.toString("utf8");
+  const chunks = splitIntoChunks(text);
+  return { ok: true, chunks, totalBytes: buf.length, language: languageForPath(abs) };
+}
+
+function buildCatBlocks(
+  chunks: string[],
+  chunkIndex: number,
+  displayPath: string,
+  totalBytes: number,
+  language: string | undefined,
+  state: CatButtonState,
+): unknown[] {
+  const lang = language ?? "";
+  const chunk = chunks[chunkIndex] ?? "";
+  const total = chunks.length;
+  const header =
+    total === 1
+      ? `:page_facing_up: \`${displayPath}\` (${totalBytes} B)`
+      : `:page_facing_up: \`${displayPath}\` — chunk ${chunkIndex + 1}/${total} (${totalBytes} B total)`;
+  const blocks: unknown[] = [
+    { type: "context", elements: [{ type: "mrkdwn", text: header }] },
+    { type: "markdown", text: "```" + lang + "\n" + chunk + "\n```" },
+  ];
+  const hasMore = chunkIndex + 1 < total;
+  if (hasMore) {
+    const nextState: CatButtonState = { ...state, i: chunkIndex + 1 };
+    blocks.push({
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Show more" },
+          action_id: CAT_SHOW_MORE_ACTION_ID,
+          value: encodeCatState(nextState),
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Show all" },
+          action_id: CAT_SHOW_ALL_ACTION_ID,
+          value: encodeCatState(nextState),
+          style: "primary",
+        },
+      ],
+    });
+  }
+  return blocks;
+}
+
+async function pathIsInsideCwd(abs: string, cwd: string): Promise<boolean> {
+  try {
+    const absReal = await realpath(abs);
+    const cwdReal = await realpath(cwd);
+    return absReal === cwdReal || absReal.startsWith(cwdReal + "/");
+  } catch {
+    return false;
+  }
+}
+
+async function handleCat(
+  app: bolt.App,
+  entry: { bridge: { sessionCwd(id: string): string | undefined }; sessionId: string },
+  channel: string,
+  threadTs: string,
+  sourceTs: string,
+  argsText: string,
+): Promise<void> {
+  const cwd = entry.bridge.sessionCwd(entry.sessionId);
+  if (!cwd) {
+    await app.client.reactions
+      .add({ channel, timestamp: sourceTs, name: "warning" })
+      .catch(() => undefined);
+    await app.client.chat
+      .postMessage({ channel, thread_ts: threadTs, text: "no cwd known for this session" })
+      .catch(() => undefined);
+    return;
+  }
+  const resolved = await resolveCatPath(argsText, cwd);
+  if (!resolved.ok) {
+    await app.client.reactions
+      .add({ channel, timestamp: sourceTs, name: "no_entry" })
+      .catch(() => undefined);
+    await app.client.chat
+      .postMessage({ channel, thread_ts: threadTs, text: `:no_entry: ${resolved.reason}` })
+      .catch(() => undefined);
+    return;
+  }
+  const loaded = await loadCatFile(resolved.abs);
+  if (!loaded.ok) {
+    await app.client.reactions
+      .add({ channel, timestamp: sourceTs, name: "warning" })
+      .catch(() => undefined);
+    await app.client.chat
+      .postMessage({ channel, thread_ts: threadTs, text: `:warning: ${loaded.reason}` })
+      .catch(() => undefined);
+    return;
+  }
+  const state: CatButtonState = {
+    s: entry.sessionId,
+    c: channel,
+    t: threadTs,
+    p: resolved.abs,
+    i: 0,
+    n: loaded.chunks.length,
+  };
+  const blocks = buildCatBlocks(
+    loaded.chunks,
+    0,
+    resolved.display,
+    loaded.totalBytes,
+    loaded.language,
+    state,
+  );
+  try {
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: `!cat ${resolved.display}`,
+      blocks: blocks as never,
+    });
+  } catch (err) {
+    log.warn(`!cat post failed: ${(err as Error).message}`);
+  }
+}
 
 // Optional per-command override for the visual ack we drop on a
 // forwarded bang. Keyed by the matched slash-form name (longest-prefix
@@ -267,6 +531,20 @@ export function createSlackApp(
         thread_ts: m.thread_ts,
         text: "```\n" + info + "\n```",
       });
+      return;
+    }
+    if (text.startsWith("!cat")) {
+      const argsText = text.slice("!cat".length).trim();
+      if (argsText.length === 0) {
+        await app.client.reactions
+          .add({ channel: m.channel, timestamp: m.ts, name: "warning" })
+          .catch(() => undefined);
+        await app.client.chat
+          .postMessage({ channel: m.channel, thread_ts: m.thread_ts, text: "usage: !cat <path>" })
+          .catch(() => undefined);
+        return;
+      }
+      await handleCat(app, entry, m.channel, m.thread_ts, m.ts, argsText);
       return;
     }
     // Strict-mirror bang routing: `!foo bar` → `/foo bar`. We look up
@@ -626,6 +904,135 @@ export function createSlackApp(
         await entry.bridge.toggleSpinnerDetails(decoded.s);
       } catch (err) {
         log.warn(`spinner-details button failed: ${(err as Error).message}`);
+      }
+    },
+  );
+
+  app.action(
+    { type: "block_actions", action_id: CAT_SHOW_MORE_ACTION_ID },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        return;
+      }
+      const state = decodeCatState(ba.value);
+      if (!state) {
+        return;
+      }
+      const entry = threadRegistry.findBySession(state.s);
+      if (!entry) {
+        return;
+      }
+      const cwd = entry.bridge.sessionCwd(state.s);
+      if (!cwd) {
+        return;
+      }
+      const inside = await pathIsInsideCwd(state.p, cwd);
+      if (!inside) {
+        await app.client.chat
+          .postMessage({
+            channel: state.c,
+            thread_ts: state.t,
+            text: ":no_entry: file no longer inside session cwd",
+          })
+          .catch(() => undefined);
+        return;
+      }
+      const loaded = await loadCatFile(state.p);
+      if (!loaded.ok || state.i >= loaded.chunks.length) {
+        return;
+      }
+      const nextBlocks = buildCatBlocks(
+        loaded.chunks,
+        state.i,
+        basename(state.p),
+        loaded.totalBytes,
+        loaded.language,
+        state,
+      );
+      await app.client.chat
+        .postMessage({
+          channel: state.c,
+          thread_ts: state.t,
+          text: `!cat ${basename(state.p)} chunk ${state.i + 1}/${state.n}`,
+          blocks: nextBlocks as never,
+        })
+        .catch((err: unknown) => {
+          log.warn(`cat_show_more post failed: ${(err as Error).message}`);
+        });
+    },
+  );
+
+  app.action(
+    { type: "block_actions", action_id: CAT_SHOW_ALL_ACTION_ID },
+    async ({ ack, body, action }) => {
+      await ack();
+      const ba = action as { value?: string };
+      const userId = (body as { user?: { id?: string } }).user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        return;
+      }
+      const state = decodeCatState(ba.value);
+      if (!state) {
+        return;
+      }
+      const entry = threadRegistry.findBySession(state.s);
+      if (!entry) {
+        return;
+      }
+      const cwd = entry.bridge.sessionCwd(state.s);
+      if (!cwd) {
+        return;
+      }
+      const inside = await pathIsInsideCwd(state.p, cwd);
+      if (!inside) {
+        return;
+      }
+      try {
+        const buf = await readFile(state.p);
+        await app.client.files.uploadV2({
+          channel_id: state.c,
+          thread_ts: state.t,
+          filename: basename(state.p),
+          file: buf,
+          initial_comment: `:page_facing_up: \`${basename(state.p)}\` — full file (${buf.length} B)`,
+        });
+      } catch (err) {
+        log.warn(`cat_show_all upload failed: ${(err as Error).message}; falling back to chunk-post`);
+        const loaded = await loadCatFile(state.p);
+        if (!loaded.ok) {
+          await app.client.chat
+            .postMessage({
+              channel: state.c,
+              thread_ts: state.t,
+              text: `:warning: show all failed: ${(err as Error).message}`,
+            })
+            .catch(() => undefined);
+          return;
+        }
+        for (let i = state.i; i < loaded.chunks.length; i++) {
+          const chunkBlocks = buildCatBlocks(
+            loaded.chunks,
+            i,
+            basename(state.p),
+            loaded.totalBytes,
+            loaded.language,
+            { ...state, i },
+          );
+          try {
+            await app.client.chat.postMessage({
+              channel: state.c,
+              thread_ts: state.t,
+              text: `!cat ${basename(state.p)} chunk ${i + 1}/${loaded.chunks.length}`,
+              blocks: chunkBlocks as never,
+            });
+          } catch (postErr) {
+            log.warn(`cat_show_all chunk post failed: ${(postErr as Error).message}`);
+            break;
+          }
+        }
       }
     },
   );
