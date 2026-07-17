@@ -309,6 +309,11 @@ interface SessionState {
   // commands. Refreshed on every available_commands_update. Used to
   // route `!<verb>` bangs and produce a useful error for typos.
   availableCommands: Map<string, string | undefined>;
+  // Slack user ids that have opted in to being @-mentioned when the
+  // agent completes a turn. Toggled via the `!notify` bang; persisted
+  // to the daemon-owned per-session extension_state bucket under the
+  // key "notify" so the preference survives daemon and bridge restarts.
+  notifyUsers: Set<string>;
   // Identifier of the backing agent process for this session
   // (e.g. "claude-acp", "codex-acp"). Seeded from sessionMeta.agentId at
   // attach time and rotated on session_info_update when /hydra agent
@@ -1368,7 +1373,7 @@ export class SessionBridge {
     if (!session.threadTs) {
       return;
     }
-    await this.opts.thread
+    const readyPost = await this.opts.thread
       .postMessage({
         channel: session.channel,
         threadTs: session.threadTs,
@@ -1376,7 +1381,21 @@ export class SessionBridge {
       })
       .catch((err: unknown) => {
         log.warn(`ready marker post failed: ${(err as Error).message}`);
+        return undefined;
       });
+    if (session.notifyUsers.size > 0 && readyPost) {
+      const link = await this.opts.thread.permalink(
+        session.channel,
+        readyPost.ts,
+      );
+      const label = session.title ?? session.sessionId.slice(0, 8);
+      const body = link
+        ? `:bell: turn complete in <${link}|${label}>`
+        : `:bell: turn complete in ${label}`;
+      for (const userId of session.notifyUsers) {
+        void this.opts.thread.directMessage(userId, body);
+      }
+    }
     // Strip the Cancel button off the processing indicator after the
     // Ready marker has posted. The processing message stays in the
     // thread as scrollback context (it shows which prompt this turn
@@ -1530,6 +1549,7 @@ export class SessionBridge {
       pendingOwnTurnEnd: undefined,
       hadActivity: false,
       availableCommands: this.pendingCommands.get(sessionId) ?? new Map(),
+      notifyUsers: new Set(),
       agentId: this.opts.sessionMeta.agentId,
     };
     this.pendingCommands.delete(sessionId);
@@ -1546,7 +1566,70 @@ export class SessionBridge {
     if (known.title) {
       await this.applyTitle(sessionId, known.title).catch(() => undefined);
     }
+    void this.hydrateNotifyUsers(session);
     return session;
+  }
+
+  private async hydrateNotifyUsers(session: SessionState): Promise<void> {
+    try {
+      const res = await this.opts.attach.request<{ value: unknown }>(
+        "hydra-acp/session/extension_state/get",
+        { sessionId: session.sessionId, key: "notify" },
+      );
+      const value = res?.value;
+      if (Array.isArray(value)) {
+        for (const u of value) {
+          if (typeof u === "string" && u.length > 0) {
+            session.notifyUsers.add(u);
+          }
+        }
+        if (session.notifyUsers.size > 0) {
+          log.info(
+            `notify: hydrated ${session.notifyUsers.size} user(s) for ${session.sessionId.slice(0, 8)}`,
+          );
+        }
+      }
+    } catch (err) {
+      log.warn(`notify hydrate failed: ${(err as Error).message}`);
+    }
+  }
+
+  // Toggle `userId` in this session's notify list. Persists to the
+  // session's extension_state bucket. Returns the new state so the
+  // caller can render a confirmation.
+  async toggleNotify(
+    sessionId: string,
+    userId: string,
+  ): Promise<{ on: boolean; users: string[] } | undefined> {
+    const s = this.sessions.get(sessionId);
+    if (!s) {
+      return undefined;
+    }
+    let on: boolean;
+    if (s.notifyUsers.has(userId)) {
+      s.notifyUsers.delete(userId);
+      on = false;
+    } else {
+      s.notifyUsers.add(userId);
+      on = true;
+    }
+    const users = [...s.notifyUsers];
+    try {
+      if (users.length === 0) {
+        await this.opts.attach.request(
+          "hydra-acp/session/extension_state/delete",
+          { sessionId, key: "notify" },
+        );
+      } else {
+        await this.opts.attach.request(
+          "hydra-acp/session/extension_state/set",
+          { sessionId, key: "notify", value: users },
+        );
+      }
+    } catch (err) {
+      log.warn(`notify persist failed: ${(err as Error).message}`);
+    }
+    return { on, users };
   }
 
   private cwdFromParams(params: Record<string, unknown>): string | undefined {

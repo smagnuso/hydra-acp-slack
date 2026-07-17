@@ -557,6 +557,35 @@ export function createSlackApp(
       await handleCat(app, entry, m.channel, m.thread_ts, m.ts, argsText);
       return;
     }
+    if (text === "!notify" || text.startsWith("!notify ")) {
+      log.info(
+        `!notify user=${m.user} session=${entry.sessionId.slice(0, 8)}`,
+      );
+      const result = await entry.bridge.toggleNotify(entry.sessionId, m.user);
+      if (!result) {
+        await app.client.chat
+          .postMessage({
+            channel: m.channel,
+            thread_ts: m.thread_ts,
+            text: ":warning: notify toggle failed (session not attached)",
+          })
+          .catch(() => undefined);
+        return;
+      }
+      const reply = result.on
+        ? `:bell: <@${m.user}> will be pinged when this session completes a turn`
+        : `:no_bell: <@${m.user}> will no longer be pinged for this session`;
+      await app.client.chat
+        .postMessage({
+          channel: m.channel,
+          thread_ts: m.thread_ts,
+          text: reply,
+        })
+        .catch((err: unknown) => {
+          log.warn(`!notify reply post failed: ${(err as Error).message}`);
+        });
+      return;
+    }
     // Strict-mirror bang routing: `!foo bar` → `/foo bar`. We look up
     // the candidate against the daemon-advertised command set
     // (available_commands_update) and only forward when it matches a

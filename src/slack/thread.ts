@@ -300,6 +300,41 @@ export class ThreadClient {
     }
   }
 
+  // Open (or reuse) a DM channel with `userId` and post `text` there.
+  // Used for the `!notify` turn-complete ping so mobile push fires
+  // reliably (thread @mentions are muted for a lot of users).
+  async directMessage(userId: string, text: string): Promise<void> {
+    try {
+      const open = await this.app.client.conversations.open({ users: userId });
+      const dm = open.channel?.id;
+      if (!dm) {
+        log.warn(`conversations.open for ${userId} returned no channel`);
+        return;
+      }
+      await this.app.client.chat.postMessage({
+        channel: dm,
+        text,
+        unfurl_links: true,
+        unfurl_media: false,
+      });
+    } catch (err) {
+      log.warn(`directMessage(${userId}) failed: ${(err as Error).message}`);
+    }
+  }
+
+  async permalink(channel: string, ts: string): Promise<string | undefined> {
+    try {
+      const res = await this.app.client.chat.getPermalink({
+        channel,
+        message_ts: ts,
+      });
+      return typeof res.permalink === "string" ? res.permalink : undefined;
+    } catch (err) {
+      log.warn(`chat.getPermalink failed: ${(err as Error).message}`);
+      return undefined;
+    }
+  }
+
   async fetchText(channel: string, ts: string): Promise<string | undefined> {
     try {
       const res = await this.app.client.conversations.replies({

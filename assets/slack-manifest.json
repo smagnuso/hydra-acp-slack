@@ -23,6 +23,7 @@
         "groups:read",
         "groups:write",
         "im:history",
+        "im:write",
         "reactions:read",
         "users:read"
       ]
