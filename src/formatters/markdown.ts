@@ -101,10 +101,106 @@ export function fitsBlockLimits(blocks: SlackBlock[]): boolean {
   return true;
 }
 
+function convertEmphasis(text: string): string {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i]!;
+    if (c === "\\" && i + 1 < n) {
+      const nxt = text[i + 1]!;
+      if (nxt === "*" || nxt === "_" || nxt === "`" || nxt === "[" || nxt === "]" || nxt === "\\") {
+        out += nxt;
+        i += 2;
+        continue;
+      }
+    }
+    if (c === "`") {
+      const close = text.indexOf("`", i + 1);
+      if (close !== -1) {
+        out += text.slice(i, close + 1);
+        i = close + 1;
+        continue;
+      }
+    }
+    if (c === "*" && text[i + 1] === "*") {
+      const close = text.indexOf("**", i + 2);
+      if (close !== -1 && close > i + 2) {
+        const inner = convertEmphasis(text.slice(i + 2, close));
+        out += `*${inner}*`;
+        i = close + 2;
+        continue;
+      }
+    }
+    if (c === "_" && text[i + 1] === "_") {
+      const close = text.indexOf("__", i + 2);
+      if (close !== -1 && close > i + 2 && !text.slice(i + 2, close).includes("\n")) {
+        const inner = convertEmphasis(text.slice(i + 2, close));
+        out += `*${inner}*`;
+        i = close + 2;
+        continue;
+      }
+    }
+    if (c === "*" && text[i + 1] !== "*") {
+      const prev = i > 0 ? text[i - 1]! : "";
+      const nextCh = text[i + 1] ?? "";
+      const openable =
+        nextCh !== "" &&
+        nextCh !== " " &&
+        nextCh !== "\t" &&
+        nextCh !== "\n" &&
+        nextCh !== "*" &&
+        !/[A-Za-z0-9]/.test(prev);
+      if (openable) {
+        let close = -1;
+        for (let j = i + 1; j < n; j++) {
+          const cj = text[j]!;
+          if (cj === "\n") {
+            break;
+          }
+          if (cj !== "*") {
+            continue;
+          }
+          if (text[j + 1] === "*") {
+            continue;
+          }
+          const before = text[j - 1]!;
+          const after = text[j + 1] ?? "";
+          if (before === " " || before === "\t" || before === "*") {
+            continue;
+          }
+          if (/[A-Za-z0-9]/.test(after)) {
+            continue;
+          }
+          close = j;
+          break;
+        }
+        if (close !== -1 && close > i + 1) {
+          const inner = convertEmphasis(text.slice(i + 1, close));
+          out += `_${inner}_`;
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
 function transform(s: string): string {
-  // **bold** -> *bold*  (and __bold__ -> *bold*)
-  s = s.replace(/\*\*([^*\n]+?)\*\*/g, "*$1*");
-  s = s.replace(/__([^_\n]+?)__/g, "*$1*");
+  // Emphasis conversion in a single pass. Slack mrkdwn uses `*bold*`
+  // and `_italic_`, so standard markdown maps as:
+  //   **foo** / __foo__ → *foo*
+  //   *foo*             → _foo_    (with flanking guards)
+  //   _foo_             → _foo_    (unchanged; word-boundary flank)
+  // We can't do these as sequential regex passes: a `**foo**` → `*foo*`
+  // rewrite would then be re-matched by the `*italic*` pass and turned
+  // into `_foo_`. The walker below emits both in one pass so the bold
+  // output is not visible to the italic rule. Inline `` `code` `` spans
+  // are copied verbatim so their contents aren't mangled.
+  s = convertEmphasis(s);
   // [text](url) -> <url|text>. For hydra://sessions/<id>, look up the
   // session in threadRegistry and rewrite to a Slack permalink URL when
   // both the thread mapping and the team domain are known. Falls back

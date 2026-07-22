@@ -11,6 +11,42 @@ test("converts **bold** and __bold__ to *bold*", () => {
   assert.equal(toSlackMrkdwn("__yo__"), "*yo*");
 });
 
+test("converts *italic* to _italic_ with flanking guards", () => {
+  assert.equal(toSlackMrkdwn("this is *cool* stuff"), "this is _cool_ stuff");
+  assert.equal(toSlackMrkdwn("*leading* word"), "_leading_ word");
+});
+
+test("does not italicize glob / pointer / multiplication false positives", () => {
+  assert.equal(toSlackMrkdwn("src/*.ts globs"), "src/*.ts globs");
+  assert.equal(toSlackMrkdwn("n * m product"), "n * m product");
+  assert.equal(toSlackMrkdwn("char *p pointer"), "char *p pointer");
+});
+
+test("**bold** and *italic* together do not corrupt each other", () => {
+  assert.equal(
+    toSlackMrkdwn("**bold** and *italic* mixed"),
+    "*bold* and _italic_ mixed",
+  );
+});
+
+test("nested **bold with *italic* inside**", () => {
+  assert.equal(
+    toSlackMrkdwn("**outer *inner* end**"),
+    "*outer _inner_ end*",
+  );
+});
+
+test("inline `code` spans are not mangled by emphasis pass", () => {
+  assert.equal(
+    toSlackMrkdwn("use `*.ts` glob and *emph* here"),
+    "use `*.ts` glob and _emph_ here",
+  );
+});
+
+test("backslash-escaped asterisks stay literal", () => {
+  assert.equal(toSlackMrkdwn("literal \\*not italic\\*"), "literal *not italic*");
+});
+
 test("converts links", () => {
   assert.equal(toSlackMrkdwn("[ex](https://e.com)"), "<https://e.com|ex>");
 });
