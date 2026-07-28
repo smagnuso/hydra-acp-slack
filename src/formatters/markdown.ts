@@ -101,6 +101,26 @@ export function fitsBlockLimits(blocks: SlackBlock[]): boolean {
   return true;
 }
 
+// Scan raw agent text (pre-mrkdwn) for markdown links of the form
+// `[label](hydra://…/sessions/<sid>[#turn-N])` and return the set of
+// referenced session ids, normalized to the canonical `hydra_session_`
+// prefix used by threadRegistry / SessionBridge. hydra:// URLs carry
+// the bare short id (`fwnUMpYUpbCHZZCM`); the rest of the bridge keys
+// off the prefixed form, so callers looking these ids up against
+// threadRegistry.onceForSession would otherwise miss the match.
+// Callers use this to schedule an async update of the posted Slack
+// message when the target session's thread mapping registers later.
+export function extractHydraSessionRefs(raw: string): string[] {
+  const out = new Set<string>();
+  const re = /\[[^\]]+\]\(hydra:\/\/(?:[^/\s)]+\/)?sessions\/([A-Za-z0-9_-]+)(?:#turn-\d+)?\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const sid = m[1]!;
+    out.add(sid.startsWith("hydra_session_") ? sid : `hydra_session_${sid}`);
+  }
+  return [...out];
+}
+
 function convertEmphasis(text: string): string {
   let out = "";
   let i = 0;
@@ -209,12 +229,15 @@ function transform(s: string): string {
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, text: string, url: string) => {
     const hydraMatch = url.match(/^hydra:\/\/(?:[^/\s]+\/)?sessions\/([A-Za-z0-9_-]+)(?:#turn-\d+)?$/);
     if (hydraMatch) {
-      const sid = hydraMatch[1]!;
+      const rawSid = hydraMatch[1]!;
+      const sid = rawSid.startsWith("hydra_session_")
+        ? rawSid
+        : `hydra_session_${rawSid}`;
       const permalink = permalinkForSession(sid);
       if (permalink) {
         return `<${permalink}|${text}>`;
       }
-      return `${text} (\`hydra://sessions/${sid}\`)`;
+      return `${text} (\`hydra://sessions/${rawSid}\`)`;
     }
     return `<${url}|${text}>`;
   });

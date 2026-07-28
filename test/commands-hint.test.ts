@@ -30,6 +30,20 @@ test("stripCommandArgsHint: only trailing tokens are peeled (interior <…> surv
   });
 });
 
+test("stripCommandArgsHint: peels trailing [optional] placeholder", () => {
+  assert.deepEqual(stripCommandArgsHint("/hydra fork [verbatim]"), {
+    name: "/hydra fork",
+    argsHint: "[verbatim]",
+  });
+});
+
+test("stripCommandArgsHint: peels mixed <required> and [optional] placeholders", () => {
+  assert.deepEqual(stripCommandArgsHint("/foo <a> [b]"), {
+    name: "/foo",
+    argsHint: "<a> [b]",
+  });
+});
+
 test("stripCommandArgsHint: empty placeholder content still matches", () => {
   assert.deepEqual(stripCommandArgsHint("/foo <>"), {
     name: "/foo",

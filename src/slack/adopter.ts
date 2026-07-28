@@ -83,6 +83,7 @@ export class SessionAdopter {
         upstreamSessionId: info.upstreamSessionId,
       },
       initialMessages,
+      onSessionReferenced: (sid) => this.adoptReferenced(sid),
     });
     attach.on("close", () => {
       // Run bundle upload before teardown so the bridge's channel /
@@ -104,6 +105,63 @@ export class SessionAdopter {
     });
     attach.start();
     this.deps.bridges.set(sessionId, { attach, bridge });
+  }
+
+  // Look up a session id mentioned in agent output (e.g. hydra:// fork
+  // link) and adopt it if the daemon knows about it — including cold
+  // sessions, which HydraDiscovery's warm-only poll would otherwise
+  // skip. Attaching warms a cold session as a side effect, so the
+  // forked session gets a thread and the markdown rewriter can
+  // resolve its permalink. Silent no-op on failure / already-adopted;
+  // this is a best-effort UX polish, not a critical path.
+  private adoptReferenced(sessionId: string): void {
+    if (this.deps.bridges.has(sessionId)) {
+      return;
+    }
+    void (async () => {
+      try {
+        const r = await fetch(
+          `${this.deps.config.hydraDaemonUrl}/v1/sessions/${sessionId}`,
+          { headers: { Authorization: `Bearer ${this.deps.config.hydraToken}` } },
+        );
+        if (!r.ok) {
+          log.debug(
+            `adoptReferenced: ${sessionId.slice(0, 8)} lookup ${r.status}; skip`,
+          );
+          return;
+        }
+        const info = (await r.json()) as {
+          sessionId?: string;
+          cwd?: string;
+          title?: string;
+          agentId?: string;
+          importedFromMachine?: string;
+          upstreamSessionId?: string;
+        };
+        // The daemon accepts either the bare short id (as it appears
+        // in hydra:// URLs) or the canonical `hydra_session_...` form
+        // on GET /v1/sessions/:id. The response always echoes the
+        // canonical id — use it so we don't create a duplicate bridge
+        // when HydraDiscovery adopts the same session under the
+        // canonical id in parallel.
+        const canonical = info.sessionId ?? sessionId;
+        if (this.deps.bridges.has(canonical)) {
+          return;
+        }
+        this.adopt({
+          sessionId: canonical,
+          cwd: info.cwd,
+          title: info.title,
+          agentId: info.agentId,
+          importedFromMachine: info.importedFromMachine,
+          upstreamSessionId: info.upstreamSessionId,
+        });
+      } catch (err) {
+        log.debug(
+          `adoptReferenced ${sessionId.slice(0, 8)} error: ${(err as Error).message}`,
+        );
+      }
+    })();
   }
 }
 

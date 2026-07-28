@@ -4,6 +4,7 @@ import type { Config } from "../config.js";
 import { synthesizeText } from "../synthesize.js";
 import {
   buildHighlightBlocks,
+  extractHydraSessionRefs,
   fitsBlockLimits,
   toSlackMrkdwn,
   type SlackBlock,
@@ -14,7 +15,7 @@ import {
   statusIcon,
 } from "../formatters/tool-call.js";
 import type { ReactionAction } from "../slack/reaction-map.js";
-import { threadRegistry } from "../slack/registry.js";
+import { permalinkForSession, threadRegistry } from "../slack/registry.js";
 import { canonicalizeSlash, matchKnownCommand } from "../slack/commands.js";
 import type { PendingMessage } from "../slack/resurrect.js";
 import { ChannelMap } from "../storage/channels.js";
@@ -175,6 +176,12 @@ interface SessionState {
   // for one agent burst. Each flush queues onto this chain so the
   // post-and-set-ts step is effectively atomic.
   agentFlushChain: Promise<void> | undefined;
+  // Unsubscribe callback for the pending hydra:// ref async-resolution
+  // subscription tied to the currently-open agent message. Cleared and
+  // replaced on each postOrUpdate that carries fresh raw text; called
+  // in closeAgentMessage so a subscription doesn't outlive the message
+  // it was going to rewrite.
+  hydraRefsCleanup: (() => void) | undefined;
   // Per-prompt entries for own (slack-originated) queued prompts.
   // Pushed when sendUserPrompt fires session/prompt to hydra; bound
   // to a server messageId when prompt_queue_added with our originator
@@ -349,6 +356,14 @@ export interface SessionBridgeOptions {
     // here. Empty for passive mirrors.
     upstreamSessionId?: string;
   };
+  // Invoked when the bridge encounters a hydra:// session reference
+  // in agent output whose target session has no thread registered.
+  // The adopter uses this to look up the referenced session via the
+  // daemon REST API and open a thread for it if it exists — even if
+  // it's cold — so fork responses like "Forked to <sid>" become
+  // clickable Slack permalinks rather than dead `hydra://` code
+  // spans. No-op when the ref is already resolved.
+  onSessionReferenced?: (sessionId: string) => void;
   // Messages buffered while the bridge wasn't yet up — typed in slack
   // against a cold thread (resurrection path) or queued by !session for
   // a session whose bridge hadn't booted yet. Forwarded to the agent
@@ -1520,6 +1535,7 @@ export class SessionBridge {
       agentLastSent: undefined,
       agentRenderedBase: 0,
       agentFlushChain: undefined,
+      hydraRefsCleanup: undefined,
       queuedPrompts: [],
       queueByMessageId: new Map(),
       peerQueueByMessageId: new Map(),
@@ -2132,7 +2148,7 @@ export class SessionBridge {
           if (fallback === session.agentLastSent) {
             return;
           }
-          await this.postOrUpdate(session, fallback, blocks);
+          await this.postOrUpdate(session, fallback, blocks, rawText);
           session.agentLastSent = fallback;
           return;
         }
@@ -2140,6 +2156,13 @@ export class SessionBridge {
     }
 
     const fullText = toSlackMrkdwn(rawText);
+    // Track whether the rendered text fits in one Slack message. Only
+    // in that case does the whole rawText correspond 1:1 to the sent
+    // slice, so the async hydra-ref rewriter has an unambiguous source
+    // to re-render. Split continuations skip the retry.
+    const singleMessage =
+      session.agentRenderedBase === 0 &&
+      fullText.length <= SLACK_MESSAGE_LIMIT;
 
     // Walk forward through fullText one Slack message at a time. Each
     // iteration handles the slice that belongs to the currently-open
@@ -2158,7 +2181,12 @@ export class SessionBridge {
         if (current === session.agentLastSent) {
           return;
         }
-        await this.postOrUpdate(session, current);
+        await this.postOrUpdate(
+          session,
+          current,
+          undefined,
+          singleMessage ? rawText : undefined,
+        );
         session.agentLastSent = current;
         return;
       }
@@ -2178,6 +2206,7 @@ export class SessionBridge {
     session: SessionState,
     text: string,
     blocks?: SlackBlock[],
+    rawForRefs?: string,
   ): Promise<void> {
     if (session.agentMessageTs) {
       log.info(
@@ -2189,6 +2218,14 @@ export class SessionBridge {
         text,
         blocks,
       );
+      if (rawForRefs !== undefined) {
+        this.scheduleHydraRefUpdate(
+          session,
+          session.agentMessageTs,
+          rawForRefs,
+          blocks !== undefined,
+        );
+      }
       return;
     }
     log.info(
@@ -2201,6 +2238,91 @@ export class SessionBridge {
       ...(blocks ? { blocks } : {}),
     });
     session.agentMessageTs = r.ts;
+    if (rawForRefs !== undefined && r.ts) {
+      this.scheduleHydraRefUpdate(session, r.ts, rawForRefs, blocks !== undefined);
+    }
+  }
+
+  // Watch for hydra:// session refs in `rawText` whose target session
+  // isn't yet in threadRegistry, and rewrite the posted Slack message
+  // (ts) once each shows up — the initial render fell back to a plain
+  // `hydra://sessions/<sid>` code-span because permalinkForSession()
+  // returned undefined. Cancels any prior subscription tied to this
+  // session's open agent message (a later flush overrides an earlier
+  // pending rewrite; the newer rawText is authoritative).
+  private scheduleHydraRefUpdate(
+    session: SessionState,
+    ts: string,
+    rawText: string,
+    hasBlocks: boolean,
+  ): void {
+    session.hydraRefsCleanup?.();
+    session.hydraRefsCleanup = undefined;
+    const refs = extractHydraSessionRefs(rawText);
+    const unresolved = refs.filter((sid) => !permalinkForSession(sid));
+    if (refs.length > 0) {
+      log.debug(
+        `hydra ref schedule ${session.sessionId.slice(0, 8)} ts=${ts} refs=[${refs.join(",")}] unresolved=[${unresolved.join(",")}]`,
+      );
+    }
+    if (unresolved.length === 0) {
+      return;
+    }
+    const channel = session.channel;
+    const offs: Array<() => void> = [];
+    let done = false;
+    const cleanup = (): void => {
+      if (done) return;
+      done = true;
+      for (const off of offs) off();
+    };
+    const attempt = (): void => {
+      if (done) return;
+      const stillUnresolved = unresolved.filter(
+        (sid) => !permalinkForSession(sid),
+      );
+      log.debug(
+        `hydra ref attempt ${session.sessionId.slice(0, 8)} ts=${ts} stillUnresolved=[${stillUnresolved.join(",")}]`,
+      );
+      if (stillUnresolved.length > 0) {
+        return;
+      }
+      cleanup();
+      void (async () => {
+        try {
+          const newText = toSlackMrkdwn(rawText);
+          if (newText.length > SLACK_MESSAGE_LIMIT) {
+            return;
+          }
+          const newBlocks = hasBlocks ? buildHighlightBlocks(rawText) : null;
+          log.debug(
+            `hydra ref rewrite ${session.sessionId.slice(0, 8)} ts=${ts} ${newText.length}ch`,
+          );
+          await this.opts.thread.updateMessage(
+            channel,
+            ts,
+            newText,
+            newBlocks ?? undefined,
+          );
+        } catch (err) {
+          log.warn(
+            `hydra ref rewrite failed for ${session.sessionId}: ${(err as Error).message}`,
+          );
+        }
+      })();
+    };
+    for (const sid of unresolved) {
+      offs.push(threadRegistry.onceForSession(sid, () => attempt()));
+      this.opts.onSessionReferenced?.(sid);
+    }
+    const timer = setTimeout(cleanup, 5 * 60 * 1000);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    session.hydraRefsCleanup = () => {
+      clearTimeout(timer);
+      cleanup();
+    };
   }
 
   // Finalize the current agent Slack message; the next agent stream will
@@ -2217,6 +2339,14 @@ export class SessionBridge {
     session.agentMessageTs = undefined;
     session.agentLastSent = undefined;
     session.agentRenderedBase = 0;
+    // Intentionally NOT clearing session.hydraRefsCleanup here. The
+    // Slack message the subscription targets still exists after the
+    // turn ends — this is exactly when we need the rewrite to fire
+    // (a `/fork` completes the turn immediately, but the forked
+    // session's thread opens seconds later once adoption + attach
+    // finish). The subscription is either replaced when the next
+    // message with unresolved refs schedules its own, or reaped by
+    // its own 5-minute timeout.
   }
 
   // Flush accumulated user-message chunks (input from another frontend
@@ -3566,17 +3696,27 @@ function exitPlanFooterText(status: string | undefined): string | undefined {
 // Split an advertised command name into the verb portion and any
 // trailing args-hint tokens. `<…>` placeholders get peeled off; the
 // remaining tail (after the last hint) is treated as still part of the
-// verb so descriptive suffixes survive. E.g.:
+// verb so descriptive suffixes survive. Trailing tokens shaped like
+// `<foo>` (required arg) or `[foo]` (optional arg) are peeled — the
+// daemon uses both forms (e.g. `hydra agent <agent>`, `hydra fork
+// [verbatim]`) and matchKnownCommand needs the bare verb as the map
+// key or the bang-command router can't recognize the shorter user
+// input. E.g.:
 //   "/hydra agent <agent>"      → { name: "/hydra agent", argsHint: "<agent>" }
+//   "/hydra fork [verbatim]"    → { name: "/hydra fork",  argsHint: "[verbatim]" }
 //   "/hydra title"              → { name: "/hydra title", argsHint: undefined }
-//   "/foo <a> <b>"              → { name: "/foo",          argsHint: "<a> <b>" }
+//   "/foo <a> [b]"              → { name: "/foo",          argsHint: "<a> [b]" }
 export function stripCommandArgsHint(raw: string): {
   name: string;
   argsHint: string | undefined;
 } {
   const tokens = raw.split(/\s+/);
   let i = tokens.length;
-  while (i > 0 && /^<[^>]*>$/.test(tokens[i - 1] ?? "")) {
+  while (
+    i > 0 &&
+    (/^<[^>]*>$/.test(tokens[i - 1] ?? "") ||
+      /^\[[^\]]*\]$/.test(tokens[i - 1] ?? ""))
+  ) {
     i--;
   }
   if (i === tokens.length) {
