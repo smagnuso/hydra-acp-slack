@@ -57,7 +57,10 @@ two browser visits.
 
 Re-run `hydra-acp slack setup` any time to sync the deployed Slack app's
 manifest with whatever's in this repo — useful when scopes or events
-change in a release.
+change in a release. When the sync adds bot scopes, the wizard walks you
+through the reinstall they require (updating the manifest declares new
+scopes but doesn't grant them to your existing bot token) and then
+verifies the token actually carries them.
 
 `AUTHORIZED_USERS` is the allowlist of Slack user IDs whose messages
 the bridge will forward to the agent (and whose reactions are honored
@@ -223,6 +226,8 @@ it accepts.
 | `DELETE_ABANDONED_THREADS`  | `false`                            | Janitor: scan known channels for `_session <id>_` thread parents whose session is no longer in hydra (live or cold) and delete the whole thread (every reply, then the parent). When `false` (default) the sweep still runs and logs `would delete abandoned thread session=<id> …` on first detection so you can validate matches before enabling. **Delete mode requires the candidate to miss two consecutive sweeps**, so a transient daemon read failure can't trigger deletions; dry-run logs immediately and dedupes per-process. Capped at 3 threads per sweep since each one issues N+1 `chat.delete` calls. |
 | `THREAD_JANITOR_INTERVAL_MS`| `60000` (delete) / `300000` (dry-run) | How often the janitor sweeps. Defaults depend on `DELETE_ABANDONED_THREADS`: 1 min when enabled (prompt cleanup), 5 min in dry-run (each sweep pages `conversations.history` across known channels, and nothing changes between sweeps once dedupe is populated). |
 | `THREAD_JANITOR_SETTLE_MS`  | `5000`                             | Delay before the first sweep so initial attaches can register. The daemon-list check covers any straggler, so this can be small. |
+| `SESSION_INDEX`             | `true`                             | Maintain one pinned message per channel listing the currently-warm sessions with a link to each session's thread — so you can jump from the channel straight to the thread you're working in. The message is posted once (the first time that channel hosts a session) and edited in place forever, including down to an empty "none right now" state. Requires the `pins:write` scope; without it the message is still posted and updated, just not pinned. |
+| `SESSION_INDEX_INTERVAL_MS` | `5000`                             | How often the index is re-derived. Renders are diffed against the last-sent text, so an unchanged session set issues zero API calls regardless of this value. |
 | `DEBUG`                     | `false`                            | Verbose logging. |
 
 ## Reactions

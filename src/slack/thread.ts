@@ -210,6 +210,75 @@ export class ThreadClient {
     return undefined;
   }
 
+  // Locate a bot-posted channel-root message carrying `marker` in its
+  // text. Used to recover the session-index message across restarts —
+  // the marker in the message text is the only record of its ts, same
+  // trick as the `_session <id>_` thread markers.
+  //
+  // Only considers top-level messages (no thread_ts), so a marker
+  // quoted inside a thread reply can never be mistaken for the index.
+  // Same ~1000-message cap as findSessionThread; the index is re-pinned
+  // and stays recent, so in practice it is found on the first page.
+  async findMarkedMessage(
+    channel: string,
+    marker: string,
+  ): Promise<string | undefined> {
+    let cursor: string | undefined;
+    let scanned = 0;
+    const cap = 1000;
+    while (scanned < cap) {
+      let res;
+      try {
+        res = await this.app.client.conversations.history({
+          channel,
+          cursor,
+          limit: 100,
+        });
+      } catch (err) {
+        log.warn(
+          `findMarkedMessage: conversations.history(${channel}) failed: ${(err as Error).message}`,
+        );
+        return undefined;
+      }
+      const messages = res.messages ?? [];
+      for (const m of messages) {
+        if (typeof m.text !== "string" || !m.text.includes(marker)) {
+          continue;
+        }
+        if (m.thread_ts && m.thread_ts !== m.ts) {
+          continue;
+        }
+        if (typeof m.ts === "string") {
+          return m.ts;
+        }
+      }
+      scanned += messages.length;
+      cursor = res.response_metadata?.next_cursor;
+      if (!cursor) {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  // Best-effort pin. Requires the `pins:write` scope, which older
+  // installs of the app do not have — a missing scope must not break
+  // the caller, so failures only log. Returns true when the message is
+  // known to be pinned (already_pinned counts).
+  async pinMessage(channel: string, ts: string): Promise<boolean> {
+    try {
+      const res = await this.app.client.pins.add({ channel, timestamp: ts });
+      return res.ok === true;
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (msg.includes("already_pinned")) {
+        return true;
+      }
+      log.warn(`pins.add(${channel}/${ts}) failed: ${msg}`);
+      return false;
+    }
+  }
+
   // Scan a channel's recent history for every thread-parent that
   // carries a `_session <id>_` marker. Pages through conversations.history
   // with the same ~1000-message cap as findSessionThread. Returns one

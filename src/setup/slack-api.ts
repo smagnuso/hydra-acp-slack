@@ -55,6 +55,40 @@ export async function callSlackForm(
   return json;
 }
 
+// Scopes actually granted to `token`, as opposed to the scopes the
+// app's manifest declares. Slack only reports these in the
+// `x-oauth-scopes` response header, not in any response body, so this
+// goes to fetch directly rather than through callSlack. auth.test is
+// used because it needs no scope of its own.
+//
+// Returns undefined when the call fails or the header is absent — the
+// caller must treat that as "unknown", never as "nothing granted".
+export async function grantedScopes(
+  token: string,
+): Promise<Set<string> | undefined> {
+  try {
+    const res = await fetch(`${SLACK_API_BASE}/auth.test`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+    });
+    const header = res.headers.get("x-oauth-scopes");
+    if (!header) {
+      return undefined;
+    }
+    return new Set(
+      header
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 export async function exchangeOAuthCode(args: {
   clientId: string;
   clientSecret: string;

@@ -4,7 +4,7 @@ import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ask, askSecret, confirm, maskToken, openBrowser, pause, pickFromList } from "./prompts.js";
-import { callSlack, callSlackForm, exchangeOAuthCode, SlackApiError } from "./slack-api.js";
+import { callSlack, callSlackForm, exchangeOAuthCode, grantedScopes, SlackApiError } from "./slack-api.js";
 import { startOAuthServer } from "./oauth-server.js";
 import { PRIMARY_CONF_PATH, readExisting, writeConf } from "./conf-writer.js";
 
@@ -543,11 +543,57 @@ async function manifestSync(args: { existingBotToken: string; existingAppId: str
     }
   }
 
-  info("Generate a one-time App Configuration Token to apply manifest changes.");
+  // Reading the deployed manifest needs a config token, so we can't
+  // diff before asking for one. But the overwhelmingly common reason to
+  // sync is a scope change, and granted scopes are readable with the
+  // bot token we already have. When those already cover the manifest,
+  // offer to skip the whole token dance.
+  const desiredScopes = loadManifest().oauth_config.scopes.bot;
+  const granted = await grantedScopes(args.existingBotToken);
+  if (granted) {
+    const missing = desiredScopes.filter((s) => !granted.has(s));
+    if (missing.length === 0) {
+      ok("Bot token already carries every scope this release needs");
+      if (!(await confirm("Check the full manifest anyway?", false))) {
+        info("Skipped. Re-run setup if events or other settings change.");
+        return;
+      }
+    } else {
+      info(`Scopes to add: ${missing.join(", ")}`);
+    }
+  }
+
+  blank();
+  info("Applying manifest changes needs an App Configuration Token: a");
+  info("short-lived token, separate from your bot token, that authorizes");
+  info("editing app configuration. Used once here, never saved.");
+  blank();
+  info("These tokens are workspace-wide, not per-app, so the page opens on");
+  info('the app list. Scroll to "App Configuration Tokens" at the bottom,');
+  info("click Generate Token, pick your workspace, then copy the Access");
+  info("Token — the one starting xoxe.xoxp-, NOT the Refresh Token.");
   await pause("Press Enter to open the Slack page...");
   openBrowser("https://api.slack.com/apps?new_app_token=1");
   blank();
-  const configToken = await askSecret("App Configuration Access Token");
+  let configToken = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    configToken = await askSecret("App Configuration Access Token (xoxe.xoxp-...)");
+    if (!configToken) {
+      warn("Skipping manifest sync.");
+      return;
+    }
+    if (configToken.startsWith("xoxe.xoxp-")) {
+      break;
+    }
+    // Pasting the refresh token is the single most common mistake here,
+    // and Slack answers it with a bare invalid_auth.
+    if (configToken.startsWith("xoxe-")) {
+      warn("That looks like the Refresh Token. Copy the Access Token instead.");
+    } else {
+      warn("Expected a token starting with xoxe.xoxp-.");
+    }
+    configToken = "";
+  }
   if (!configToken) {
     warn("Skipping manifest sync.");
     return;
@@ -604,13 +650,67 @@ async function manifestSync(args: { existingBotToken: string; existingAppId: str
     warn("Skipped manifest update.");
     return;
   }
+  const addedScopes = desS.oauth_config.scopes.bot.filter(
+    (s) => !curS.oauth_config.scopes.bot.includes(s),
+  );
   try {
     await callSlack("apps.manifest.update", configToken, { app_id: appId, manifest: desired });
     ok("Manifest synced");
   } catch (err) {
     const msg = err instanceof SlackApiError ? err.slackError : (err as Error).message;
     warn(`Manifest update failed: ${msg}`);
+    return;
   }
+  if (addedScopes.length > 0) {
+    await reinstallForScopes({ appId, botToken: args.existingBotToken, addedScopes });
+  }
+}
+
+// Updating the manifest declares new scopes but does not grant them:
+// the existing bot token was minted under the old scope set and keeps
+// it until the app is reinstalled. Without this step the wizard reports
+// success while every API call needing a new scope keeps failing with
+// missing_scope, which is a miserable thing to debug.
+async function reinstallForScopes(args: {
+  appId: string;
+  botToken: string;
+  addedScopes: string[];
+}): Promise<void> {
+  blank();
+  warn(`New scopes (${args.addedScopes.join(", ")}) require reinstalling the app.`);
+  info("Your current bot token does not carry them yet.");
+  if (!(await confirm("Open the install page now?", true))) {
+    info("Reinstall later at:");
+    info(`  https://api.slack.com/apps/${args.appId}/install-on-team`);
+    return;
+  }
+  openBrowser(`https://api.slack.com/apps/${args.appId}/install-on-team`);
+  blank();
+  info('Click "Reinstall to Workspace" and approve the new permissions.');
+  await pause("Press Enter once that's done...");
+
+  // Verify rather than assume. A reinstall to the same workspace
+  // normally reissues the identical bot token, so slack.conf usually
+  // needs no edit — but "usually" isn't "always", and a silently
+  // unverified reinstall reintroduces exactly the bug this step exists
+  // to prevent.
+  const granted = await grantedScopes(args.botToken);
+  if (!granted) {
+    warn("Could not read granted scopes; skipping verification.");
+    info("If permissions still fail, check SLACK_BOT_TOKEN in slack.conf");
+    info("against the token on the Install App page.");
+    return;
+  }
+  const missing = args.addedScopes.filter((s) => !granted.has(s));
+  if (missing.length === 0) {
+    ok("New scopes granted to the current bot token");
+    return;
+  }
+  warn(`Still missing: ${missing.join(", ")}`);
+  info("The reinstall may not have completed, or it issued a new bot token.");
+  info("Check the Bot User OAuth Token on the Install App page and update");
+  info(`SLACK_BOT_TOKEN in ${PRIMARY_CONF_PATH} if it differs from`);
+  info(`  ${maskToken(args.botToken)}`);
 }
 
 async function step7RegisterExtension(): Promise<void> {

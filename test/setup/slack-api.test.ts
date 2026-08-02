@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { afterEach, beforeEach, test } from "node:test";
-import { callSlack, callSlackForm, exchangeOAuthCode, SlackApiError } from "../../src/setup/slack-api.js";
+import { callSlack, callSlackForm, exchangeOAuthCode, grantedScopes, SlackApiError } from "../../src/setup/slack-api.js";
 
 interface CapturedRequest {
   url: string;
@@ -11,7 +11,11 @@ interface CapturedRequest {
 
 const realFetch = globalThis.fetch;
 let captured: CapturedRequest[] = [];
-let nextResponse: { status?: number; body: unknown } = { body: { ok: true } };
+let nextResponse: {
+  status?: number;
+  body: unknown;
+  headers?: Record<string, string>;
+} = { body: { ok: true } };
 
 function installMockFetch(): void {
   captured = [];
@@ -30,7 +34,7 @@ function installMockFetch(): void {
     });
     return new Response(JSON.stringify(nextResponse.body), {
       status: nextResponse.status ?? 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(nextResponse.headers ?? {}) },
     });
   }) as typeof fetch;
 }
@@ -110,4 +114,29 @@ test("exchangeOAuthCode: throws when slack returns ok:false", async () => {
       }),
     (err: unknown) => err instanceof SlackApiError && err.slackError === "invalid_code",
   );
+});
+
+test("grantedScopes: parses the x-oauth-scopes header", async () => {
+  nextResponse = {
+    body: { ok: true },
+    headers: { "x-oauth-scopes": "chat:write,pins:write, reactions:write " },
+  };
+  const scopes = await grantedScopes("xoxb-1");
+  assert.ok(scopes);
+  assert.ok(scopes.has("chat:write"));
+  assert.ok(scopes.has("pins:write"));
+  assert.ok(scopes.has("reactions:write"));
+  assert.equal(scopes.size, 3);
+});
+
+test("grantedScopes: returns undefined when the header is absent", async () => {
+  nextResponse = { body: { ok: true } };
+  assert.equal(await grantedScopes("xoxb-1"), undefined);
+});
+
+test("grantedScopes: returns undefined rather than empty when the call throws", async () => {
+  globalThis.fetch = (async () => {
+    throw new Error("network down");
+  }) as typeof fetch;
+  assert.equal(await grantedScopes("xoxb-1"), undefined);
 });

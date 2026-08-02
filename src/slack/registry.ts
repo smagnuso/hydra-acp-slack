@@ -124,6 +124,17 @@ class ThreadRegistry {
     return undefined;
   }
 
+  // Every registered entry across all threads, highest-priority first
+  // within each thread. The session index uses this to group live
+  // sessions by channel; it must not mutate the returned array.
+  entries(): ThreadEntry[] {
+    const out: ThreadEntry[] = [];
+    for (const list of this.byThread.values()) {
+      out.push(...list);
+    }
+    return out;
+  }
+
   // All candidate bridges for a thread, in priority order. Inbound
   // message routing iterates this and falls back on send error.
   lookupAll(channel: string, threadTs: string): ThreadEntry[] {

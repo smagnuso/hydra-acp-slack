@@ -12,6 +12,7 @@ import {
 import { HydraDiscovery } from "./hydra-discovery.js";
 import { createSlackApp } from "./slack/app.js";
 import { SessionAdopter, type AdopterRef, type AttachContext } from "./slack/adopter.js";
+import { SessionIndex } from "./slack/session-index.js";
 import { ThreadClient } from "./slack/thread.js";
 import { ThreadJanitor } from "./slack/thread-janitor.js";
 import { ChannelMap } from "./storage/channels.js";
@@ -125,6 +126,16 @@ async function main(): Promise<void> {
   });
   discovery.start();
 
+  let sessionIndex: SessionIndex | undefined;
+  if (config.sessionIndexEnabled) {
+    sessionIndex = new SessionIndex({
+      thread,
+      currentSessions: () => discovery.current(),
+      intervalMs: config.sessionIndexIntervalMs,
+    });
+    sessionIndex.start();
+  }
+
   const janitor = new ThreadJanitor({
     thread,
     channels,
@@ -143,6 +154,7 @@ async function main(): Promise<void> {
     clearInterval(flushTimer);
     try {
       discovery.stop();
+      sessionIndex?.stop();
       janitor.stop();
       // Flush any pending text before tearing down.
       for (const ctx of bridges.values()) {

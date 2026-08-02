@@ -24,7 +24,9 @@
         "groups:write",
         "im:history",
         "im:write",
+        "pins:write",
         "reactions:read",
+        "reactions:write",
         "users:read"
       ]
     },

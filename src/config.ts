@@ -46,6 +46,14 @@ export interface Config {
   deleteAbandonedThreads: boolean;
   threadJanitorIntervalMs: number;
   threadJanitorSettleMs: number;
+  // Maintain a single pinned message per channel listing the warm
+  // sessions that have a thread there, each linking to its thread. The
+  // message is posted once and chat.update'd in place forever.
+  sessionIndexEnabled: boolean;
+  // Floor between chat.update calls for the index. Discovery polls far
+  // faster than this; renders are coalesced and only sent when the
+  // rendered text actually changed.
+  sessionIndexIntervalMs: number;
   debug: boolean;
 }
 
@@ -201,6 +209,8 @@ export function loadConfig(path: string = configPath()): Config {
       bool(map, "DELETE_ABANDONED_THREADS", false) ? 60_000 : 300_000,
     ),
     threadJanitorSettleMs: intVal(map, "THREAD_JANITOR_SETTLE_MS", 5_000),
+    sessionIndexEnabled: bool(map, "SESSION_INDEX", true),
+    sessionIndexIntervalMs: intVal(map, "SESSION_INDEX_INTERVAL_MS", 5_000),
     debug: bool(map, "DEBUG", false),
   };
 }
