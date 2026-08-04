@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { convertMarkdownTables } from "../src/formatters/tables.js";
+import { convertMarkdownTables, splitRowCells } from "../src/formatters/tables.js";
 
 test("converts a simple GFM table to a code-fenced aligned block", () => {
   const input = [
@@ -65,4 +65,37 @@ test("leaves non-table fenced blocks alone even when they contain pipes", () => 
     "```",
   ].join("\n");
   assert.equal(convertMarkdownTables(input), input);
+});
+
+test("escaped pipes inside cells do not create phantom columns", () => {
+  const input = [
+    "| Gate | Code | Verdict |",
+    "|---|---|---|",
+    "| pane? | `a.is_some() \\| b.is_some()` (state.rs:1951) | ok |",
+    "| render | `.or_else(\\| \\| label())` (nav.rs:475) | ok |",
+  ].join("\n");
+  const out = convertMarkdownTables(input);
+  const rows = out.split("\n").filter((l) => l.startsWith("|"));
+  for (const row of rows) {
+    // 3 columns → exactly 4 unescaped delimiters per row.
+    const delims = row.replace(/\\\|/g, "").match(/\|/g)?.length ?? 0;
+    assert.equal(delims, 4, `row has wrong column count: ${row}`);
+  }
+  assert.match(out, /`a\.is_some\(\) \\\| b\.is_some\(\)` \(state\.rs:1951\)/);
+});
+
+test("pipes inside code spans are not cell delimiters", () => {
+  const input = [
+    "| expr | note |",
+    "|---|---|",
+    "| `a | b` | bitwise or |",
+  ].join("\n");
+  assert.deepEqual(splitRowCells("| `a | b` | bitwise or |"), [
+    "`a | b`",
+    "bitwise or",
+  ]);
+  const out = convertMarkdownTables(input);
+  // Two columns → separator has exactly two dash segments.
+  assert.equal(out.split("\n")[2]?.match(/-+/g)?.length, 2);
+  assert.match(out, /\| `a \| b` +\| bitwise or \|/);
 });

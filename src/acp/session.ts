@@ -2140,18 +2140,28 @@ export class SessionBridge {
     // initial Slack message — once we've rolled over a continuation, we
     // stay in text mode (blocks-mode doesn't split). If the blocks
     // wouldn't fit within Slack's per-block limits, fall through too.
+    //
+    // The mrkdwn `text` field is only a notification/legacy-client
+    // fallback here — the block carries what users actually see — so an
+    // oversized fallback is truncated rather than used as a reason to
+    // abandon blocks mode. Bailing on it used to make a long
+    // table-bearing message visibly flip from a native Slack table to
+    // the monospace fallback mid-stream, because a later text-mode
+    // update clears the blocks (thread.updateMessage sends blocks: []).
     if (session.agentRenderedBase === 0) {
       const blocks = buildHighlightBlocks(rawText);
       if (blocks && fitsBlockLimits(blocks)) {
-        const fallback = toSlackMrkdwn(rawText);
-        if (fallback.length <= SLACK_MESSAGE_LIMIT) {
-          if (fallback === session.agentLastSent) {
-            return;
-          }
-          await this.postOrUpdate(session, fallback, blocks, rawText);
-          session.agentLastSent = fallback;
+        const rendered = toSlackMrkdwn(rawText);
+        const fallback =
+          rendered.length <= SLACK_MESSAGE_LIMIT
+            ? rendered
+            : rendered.slice(0, findSplitPoint(rendered, SLACK_MESSAGE_LIMIT));
+        if (fallback === session.agentLastSent) {
           return;
         }
+        await this.postOrUpdate(session, fallback, blocks, rawText);
+        session.agentLastSent = fallback;
+        return;
       }
     }
 

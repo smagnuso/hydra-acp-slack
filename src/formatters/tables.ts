@@ -140,15 +140,59 @@ export function unwrapFencedTables(text: string): string {
   return out.join("\n");
 }
 
-function parseRow(line: string): string[] {
+// Split a table row on cell delimiters only. A `|` is a delimiter unless
+// it is backslash-escaped (`\|`, GFM's in-cell literal pipe) or sits
+// inside a backtick code span — both are extremely common in agent
+// output (`a.is_some() \| b.is_some()`, `.or_else(\| \| …)`) and a naive
+// split() on them invents phantom columns.
+export function splitRowCells(line: string): string[] {
   let inner = line.trim();
   if (inner.startsWith("|")) {
     inner = inner.slice(1);
   }
-  if (inner.endsWith("|")) {
+  // Only strip the trailing delimiter if it isn't escaped.
+  if (inner.endsWith("|") && !inner.endsWith("\\|")) {
     inner = inner.slice(0, -1);
   }
-  return inner.split("|").map((c) => c.trim());
+  const cells: string[] = [];
+  let cell = "";
+  let tickRun = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i]!;
+    if (c === "\\" && i + 1 < inner.length) {
+      cell += c + inner[i + 1];
+      i++;
+      continue;
+    }
+    if (c === "`") {
+      // Count the run length so ``a | b`` spans work too; a code span
+      // closes on a backtick run of equal length.
+      let run = 1;
+      while (inner[i + run] === "`") {
+        run++;
+      }
+      if (tickRun === 0) {
+        tickRun = run;
+      } else if (tickRun === run) {
+        tickRun = 0;
+      }
+      cell += "`".repeat(run);
+      i += run - 1;
+      continue;
+    }
+    if (c === "|" && tickRun === 0) {
+      cells.push(cell.trim());
+      cell = "";
+      continue;
+    }
+    cell += c;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function parseRow(line: string): string[] {
+  return splitRowCells(line);
 }
 
 function formatTable(rawRows: string[]): string {
