@@ -69,7 +69,7 @@ export class HydraDiscovery {
     }
     this.inFlight = true;
     try {
-      const r = await fetch(`${this.opts.daemonUrl}/v1/sessions`, {
+      const r = await fetch(`${this.opts.daemonUrl}/v1/sessions?status=warm`, {
         headers: { Authorization: `Bearer ${this.opts.token}` },
       });
       if (!r.ok) {
@@ -77,10 +77,16 @@ export class HydraDiscovery {
         return;
       }
       const body = (await r.json()) as { sessions: HydraSessionInfo[] };
-      // The daemon's default `/v1/sessions` view already filters out
-      // non-interactive rows (cat one-shots, editor-spawned empty
-      // sessions). We just skip cold rows here — slack only mirrors
-      // warm sessions.
+      // `status=warm`: the daemon returns only LIVE sessions, answered from its
+      // in-memory map without reading the session store. This poll runs every
+      // couple of seconds forever, and the unfiltered view costs the daemon
+      // ~200ms of CPU per uncached call once an install has a thousand cold
+      // records — all of it to produce rows we discard below. The default view
+      // also filters out non-interactive rows (cat one-shots, editor-spawned
+      // empty sessions), which we still want.
+      //
+      // The status check stays as a belt: an older daemon ignores the query
+      // param and hands back everything, and the Slack bridge must only act on warm.
       const seen = new Map<string, HydraSessionInfo>();
       for (const s of body.sessions) {
         if (s.status !== "warm") {
