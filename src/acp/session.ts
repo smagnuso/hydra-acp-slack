@@ -69,6 +69,13 @@ export function findSplitPoint(text: string, limit: number): number {
   return limit;
 }
 
+// Change-detection key for a blocks-mode agent message: the payload the
+// user actually sees, which is the block text rather than the mrkdwn
+// fallback the same call sends alongside it.
+export function blocksKey(blocks: SlackBlock[]): string {
+  return blocks.map((b) => (b.type === "markdown" ? b.text : b.type)).join("\n");
+}
+
 interface QueuedPromptEntry {
   text: string;
   promptTs: string | undefined;
@@ -162,8 +169,16 @@ interface SessionState {
   agentChunks: string[];
   agentMessageTs: string | undefined;
   // Last text written to Slack for the currently-open agent message; used
-  // to skip no-op updates when a flush fires with no new chunks.
+  // to skip no-op updates when a flush fires with no new chunks. Only set
+  // by the text-mode path — blocks-mode dedupes on agentLastBlocksKey,
+  // since its `text` argument is a fallback that stops changing once the
+  // message outgrows SLACK_MESSAGE_LIMIT.
   agentLastSent: string | undefined;
+  // Same, for the blocks-mode path: blocksKey() of the last block array
+  // written. Tracked separately rather than sharing agentLastSent because
+  // a message can flip from text mode into blocks mode mid-stream (the
+  // fence or table arrives late), and the two key spaces must not collide.
+  agentLastBlocksKey: string | undefined;
   // Offset into the rendered text (toSlackMrkdwn(agentChunks.join(""))) at
   // which the currently-open Slack message begins. Advances when a flush
   // rolls over into a continuation message after hitting Slack's
@@ -1533,6 +1548,7 @@ export class SessionBridge {
       agentChunks: [],
       agentMessageTs: undefined,
       agentLastSent: undefined,
+      agentLastBlocksKey: undefined,
       agentRenderedBase: 0,
       agentFlushChain: undefined,
       hydraRefsCleanup: undefined,
@@ -2151,16 +2167,24 @@ export class SessionBridge {
     if (session.agentRenderedBase === 0) {
       const blocks = buildHighlightBlocks(rawText);
       if (blocks && fitsBlockLimits(blocks)) {
+        // Dedupe on the block text, never on the fallback. Once
+        // `rendered` passes SLACK_MESSAGE_LIMIT the fallback stops
+        // changing (findSplitPoint only searches the first `limit`
+        // chars), so keying the no-op check off it froze the message at
+        // whatever the agent had streamed when it crossed that line and
+        // silently dropped the rest of the turn.
+        const key = blocksKey(blocks);
+        if (key === session.agentLastBlocksKey) {
+          return;
+        }
         const rendered = toSlackMrkdwn(rawText);
         const fallback =
           rendered.length <= SLACK_MESSAGE_LIMIT
             ? rendered
             : rendered.slice(0, findSplitPoint(rendered, SLACK_MESSAGE_LIMIT));
-        if (fallback === session.agentLastSent) {
-          return;
-        }
         await this.postOrUpdate(session, fallback, blocks, rawText);
-        session.agentLastSent = fallback;
+        session.agentLastBlocksKey = key;
+        session.agentLastSent = undefined;
         return;
       }
     }
@@ -2198,6 +2222,7 @@ export class SessionBridge {
           singleMessage ? rawText : undefined,
         );
         session.agentLastSent = current;
+        session.agentLastBlocksKey = undefined;
         return;
       }
 
@@ -2209,6 +2234,7 @@ export class SessionBridge {
       session.agentRenderedBase += splitAt;
       session.agentMessageTs = undefined;
       session.agentLastSent = undefined;
+      session.agentLastBlocksKey = undefined;
     }
   }
 
@@ -2348,6 +2374,7 @@ export class SessionBridge {
     session.agentChunks = [];
     session.agentMessageTs = undefined;
     session.agentLastSent = undefined;
+    session.agentLastBlocksKey = undefined;
     session.agentRenderedBase = 0;
     // Intentionally NOT clearing session.hydraRefsCleanup here. The
     // Slack message the subscription targets still exists after the
