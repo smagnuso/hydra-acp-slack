@@ -69,6 +69,60 @@ export function findSplitPoint(text: string, limit: number): number {
   return limit;
 }
 
+// Pick a split offset within the RAW (pre-render) text whose rendered form
+// still fits `limit`. Slack counts rendered characters, but the seam has to
+// be remembered in raw coordinates: toSlackMrkdwn is NOT prefix-stable. A
+// `**bold**` that only closes in a later chunk, or a table row wide enough
+// to re-pad every row above it, changes the rendered length of text we have
+// already sent. A remembered *rendered* offset therefore drifts out from
+// under us and slices the continuation mid-word.
+//
+// Rendering is monotonic enough in raw length for a binary search to land
+// on the boundary, and every candidate is checked with a real render, so
+// the returned prefix always fits. Then prefer a natural boundary inside
+// that prefix (paragraph break, newline, sentence) using the same limit/2
+// floor as findSplitPoint, so heads don't come out absurdly tiny. Always
+// returns at least 1 so the caller's roll-over loop makes progress.
+export function findRawSplitPoint(
+  raw: string,
+  limit: number,
+  render: (s: string) => string,
+): number {
+  let lo = 1;
+  let hi = raw.length;
+  let best = 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (render(raw.slice(0, mid)).length <= limit) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  const window = raw.slice(0, best);
+  const floor = best / 2;
+
+  const paraIdx = window.lastIndexOf("\n\n");
+  if (paraIdx !== -1 && paraIdx + 2 >= floor) {
+    return paraIdx + 2;
+  }
+  const nlIdx = window.lastIndexOf("\n");
+  if (nlIdx !== -1 && nlIdx + 1 >= floor) {
+    return nlIdx + 1;
+  }
+  const sentIdx = Math.max(
+    window.lastIndexOf(". "),
+    window.lastIndexOf("! "),
+    window.lastIndexOf("? "),
+  );
+  if (sentIdx !== -1 && sentIdx + 2 >= floor) {
+    return sentIdx + 2;
+  }
+  return best;
+}
+
 // Change-detection key for a blocks-mode agent message: the payload the
 // user actually sees, which is the block text rather than the mrkdwn
 // fallback the same call sends alongside it.
@@ -179,11 +233,16 @@ interface SessionState {
   // a message can flip from text mode into blocks mode mid-stream (the
   // fence or table arrives late), and the two key spaces must not collide.
   agentLastBlocksKey: string | undefined;
-  // Offset into the rendered text (toSlackMrkdwn(agentChunks.join(""))) at
-  // which the currently-open Slack message begins. Advances when a flush
-  // rolls over into a continuation message after hitting Slack's
-  // per-message size limit; reset to 0 in closeAgentMessage.
-  agentRenderedBase: number;
+  // Offset into the RAW text (agentChunks.join("")) at which the
+  // currently-open Slack message begins. Advances when a flush rolls over
+  // into a continuation message after hitting Slack's per-message size
+  // limit; reset to 0 in closeAgentMessage.
+  //
+  // Deliberately a raw offset, not a rendered one: toSlackMrkdwn is not
+  // prefix-stable, so a rendered offset captured at split time no longer
+  // points at the same seam once a later chunk closes an emphasis span or
+  // widens a table column. See findRawSplitPoint.
+  agentRawBase: number;
   // Per-session flush serializer. Concurrent calls (periodic timer +
   // turn_complete arm + user_message_chunk arm + own-turn end after
   // session/prompt) would otherwise race on agentMessageTs — both seeing
@@ -1549,7 +1608,7 @@ export class SessionBridge {
       agentMessageTs: undefined,
       agentLastSent: undefined,
       agentLastBlocksKey: undefined,
-      agentRenderedBase: 0,
+      agentRawBase: 0,
       agentFlushChain: undefined,
       hydraRefsCleanup: undefined,
       queuedPrompts: [],
@@ -2145,7 +2204,7 @@ export class SessionBridge {
         `flushAgentMessage with no threadTs for ${session.sessionId}; dropping`,
       );
       session.agentChunks = [];
-      session.agentRenderedBase = 0;
+      session.agentRawBase = 0;
       return;
     }
     const rawText = session.agentChunks.join("");
@@ -2164,7 +2223,7 @@ export class SessionBridge {
     // table-bearing message visibly flip from a native Slack table to
     // the monospace fallback mid-stream, because a later text-mode
     // update clears the blocks (thread.updateMessage sends blocks: []).
-    if (session.agentRenderedBase === 0) {
+    if (session.agentRawBase === 0) {
       const blocks = buildHighlightBlocks(rawText);
       if (blocks && fitsBlockLimits(blocks)) {
         // Dedupe on the block text, never on the fallback. Once
@@ -2189,29 +2248,26 @@ export class SessionBridge {
       }
     }
 
-    const fullText = toSlackMrkdwn(rawText);
-    // Track whether the rendered text fits in one Slack message. Only
-    // in that case does the whole rawText correspond 1:1 to the sent
-    // slice, so the async hydra-ref rewriter has an unambiguous source
-    // to re-render. Split continuations skip the retry.
-    const singleMessage =
-      session.agentRenderedBase === 0 &&
-      fullText.length <= SLACK_MESSAGE_LIMIT;
-
-    // Walk forward through fullText one Slack message at a time. Each
-    // iteration handles the slice that belongs to the currently-open
-    // (or about-to-be-opened) Slack message; once that slice fits
-    // within SLACK_MESSAGE_LIMIT, the loop is done. If it doesn't,
-    // finalize the current message at a safe split point, advance
-    // agentRenderedBase, and let the next iteration post the remainder
-    // as a fresh continuation message.
+    // Walk forward through the raw text one Slack message at a time. Each
+    // iteration renders ONLY the raw tail belonging to the currently-open
+    // (or about-to-be-opened) Slack message, so a render shift inside text
+    // we already finalized cannot move this message's start. Once that
+    // tail's render fits within SLACK_MESSAGE_LIMIT the loop is done; if it
+    // doesn't, finalize the head here, advance agentRawBase, and let the
+    // next iteration post the remainder as a fresh continuation message.
     while (true) {
-      const current = fullText.slice(session.agentRenderedBase);
+      const raw = rawText.slice(session.agentRawBase);
+      const current = toSlackMrkdwn(raw);
       if (!current.trim()) {
         return;
       }
 
       if (current.length <= SLACK_MESSAGE_LIMIT) {
+        // Only when this is the whole (unsplit) message does rawText
+        // correspond 1:1 to what we sent, giving the async hydra-ref
+        // rewriter an unambiguous source to re-render. Split
+        // continuations skip the retry.
+        const singleMessage = session.agentRawBase === 0;
         if (current === session.agentLastSent) {
           return;
         }
@@ -2226,12 +2282,16 @@ export class SessionBridge {
         return;
       }
 
-      // Overflow: split current at a safe boundary, finalize the head
-      // in this Slack message, and roll over to a new one for the tail.
-      const splitAt = findSplitPoint(current, SLACK_MESSAGE_LIMIT);
-      const head = current.slice(0, splitAt);
-      await this.postOrUpdate(session, head);
-      session.agentRenderedBase += splitAt;
+      // Overflow: split the raw tail at a boundary whose render fits,
+      // finalize that head in this Slack message, and roll over to a new
+      // one for the remainder.
+      const splitAt = findRawSplitPoint(
+        raw,
+        SLACK_MESSAGE_LIMIT,
+        toSlackMrkdwn,
+      );
+      await this.postOrUpdate(session, toSlackMrkdwn(raw.slice(0, splitAt)));
+      session.agentRawBase += splitAt;
       session.agentMessageTs = undefined;
       session.agentLastSent = undefined;
       session.agentLastBlocksKey = undefined;
@@ -2375,7 +2435,7 @@ export class SessionBridge {
     session.agentMessageTs = undefined;
     session.agentLastSent = undefined;
     session.agentLastBlocksKey = undefined;
-    session.agentRenderedBase = 0;
+    session.agentRawBase = 0;
     // Intentionally NOT clearing session.hydraRefsCleanup here. The
     // Slack message the subscription targets still exists after the
     // turn ends — this is exactly when we need the rewrite to fire
