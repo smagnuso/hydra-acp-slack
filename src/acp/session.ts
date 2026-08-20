@@ -163,6 +163,12 @@ interface QueuedPromptEntry {
   // handlePromptQueueAdded by firing cancel_prompt immediately after
   // binding.
   pendingCancel?: boolean;
+  // True between hydra-acp/prompt_queue/held and .../released for this
+  // entry: it reached the head of the queue but was not dispatched
+  // because the agent is mid-way through a turn it started itself. The
+  // hold is unbounded, so the indicator must say so rather than read as
+  // an ordinary "queued".
+  held?: boolean;
   // Barrier the prompt_queue_removed{started} handler awaits before
   // posting the Processing indicator for this entry. Captures the
   // session-level pendingOwnTurnEnd as it was *at the moment this
@@ -189,6 +195,9 @@ interface PeerQueueIndicator {
   // "hydra-acp-browser", etc.). Used to attribute the indicator with
   // "(from <name>)" so Slack viewers know who queued it.
   originatorName: string | undefined;
+  // Same as QueuedPromptEntry.held: a peer's prompt can be held by an
+  // agent-initiated turn just as ours can.
+  held?: boolean;
 }
 
 interface ToolCallState {
@@ -293,6 +302,24 @@ interface SessionState {
   // signal the originator receives. Used as targetMessageId for the
   // Amend button on queued indicators. Cleared on turn_complete.
   currentHeadMessageId: string | undefined;
+  // True between an unsolicited `turn_started` and its matching
+  // `turn_ended`, hydra's markers for a turn the agent began with no
+  // prompt behind it, typically because a background Monitor or
+  // backgrounded Bash finished and the harness restarted the agent. See
+  // PROTOCOL.md "Agent-initiated turns".
+  //
+  // These are deliberately NOT turn_complete, so none of the
+  // turn_complete-driven cleanup fires for them. Without tracking the
+  // pair the spinner is never finalized (its 30s ticker then chat.updates
+  // forever), the open agent message is never closed (so the next turn's
+  // prose appends into it), and turnToolCallIds / spinnerStartedAt leak
+  // into the next turn's Ready marker.
+  //
+  // The flag is what keeps the pairing honest: turn_started/turn_ended
+  // are written to history.jsonl, so a `historyPolicy: "full"` attach
+  // replays them, and a daemon restart mid-turn can leave an unbalanced
+  // turn_started behind. Mirrors the TUI's `unsolicitedTurnOpen`.
+  unsolicitedTurnOpen: boolean;
   // When the triggering prompt was transcribed from voice, synthesize the
   // agent's response as audio and upload it to the thread.
   voiceSynthPending: boolean;
@@ -664,6 +691,16 @@ export class SessionBridge {
       await this.handlePromptQueueRemoved(sessionId, params);
       return;
     }
+    if (n.method === "hydra-acp/prompt_queue/held" && sessionId) {
+      log.debug(`notification ${n.method} sessionId=${sessionId}`);
+      await this.handlePromptQueueHold(sessionId, params, true);
+      return;
+    }
+    if (n.method === "hydra-acp/prompt_queue/released" && sessionId) {
+      log.debug(`notification ${n.method} sessionId=${sessionId}`);
+      await this.handlePromptQueueHold(sessionId, params, false);
+      return;
+    }
     if (n.method === "hydra-acp/prompt/amended" && sessionId) {
       log.debug(`notification ${n.method} sessionId=${sessionId}`);
       const cancelledMessageId =
@@ -860,6 +897,73 @@ export class SessionBridge {
         await this.finalizeSpinner(session, stopReason);
         this.maybeSynthesizeVoiceResponse(session);
         session.currentHeadMessageId = undefined;
+        break;
+      }
+      case "turn_started": {
+        // hydra opened a synthetic turn because the agent restarted
+        // itself with no prompt in flight (PROTOCOL.md "Agent-initiated
+        // turns"). Only the unsolicited flavour concerns us; anything
+        // else is a turn we already track through the queue events.
+        const hydraMeta = readHydraMeta(update._meta);
+        if (hydraMeta?.unsolicited !== true) {
+          break;
+        }
+        if (session.unsolicitedTurnOpen) {
+          break;
+        }
+        session.unsolicitedTurnOpen = true;
+        // No prompt is in flight during an agent-initiated turn, so the
+        // last head we recorded belongs to a turn that has already
+        // completed. Drop it rather than let the Amend button on a
+        // held prompt target a finished messageId.
+        session.currentHeadMessageId = undefined;
+        const cause = readCauseLabel(hydraMeta.cause);
+        log.info(
+          `turn_started ${sessionId.slice(0, 8)} unsolicited${cause ? ` (${cause})` : ""}`,
+        );
+        // Close the previous turn's message before any of this turn's
+        // content streams, so the resumption doesn't append into it.
+        await this.flushAgentMessage(session);
+        this.closeAgentMessage(session);
+        await this.postUnsolicitedHeader(session, cause);
+        break;
+      }
+      case "turn_ended": {
+        const hydraMeta = readHydraMeta(update._meta);
+        if (hydraMeta?.unsolicited !== true) {
+          break;
+        }
+        // Guard on our own flag rather than trusting the event: a replay
+        // or a daemon restart can hand us a turn_ended whose start we
+        // never saw, and finalizing on it would steal the spinner of
+        // whatever turn is actually running.
+        if (!session.unsolicitedTurnOpen) {
+          break;
+        }
+        session.unsolicitedTurnOpen = false;
+        const reason =
+          typeof hydraMeta.reason === "string" ? hydraMeta.reason : undefined;
+        log.info(
+          `turn_ended ${sessionId.slice(0, 8)} unsolicited (${reason ?? "none"})`,
+        );
+        // "superseded" means a user prompt took over an agent-initiated
+        // turn that was still running: the agent keeps working, and that
+        // prompt's own turn end (or hydra's salvage of it) owns the
+        // finalize. Finalizing here would delete the spinner out from
+        // under the turn still producing output.
+        if (reason === "superseded") {
+          break;
+        }
+        await this.flushAgentMessage(session);
+        this.closeAgentMessage(session);
+        // "completed" is the ordinary end and should read as a plain
+        // Ready; the others carry through to the marker the same way a
+        // stopReason does on turn_complete.
+        await this.finalizeSpinner(
+          session,
+          reason === "completed" ? undefined : reason,
+        );
+        this.maybeSynthesizeVoiceResponse(session);
         break;
       }
       case "tool_call":
@@ -1317,6 +1421,33 @@ export class SessionBridge {
     await this.refreshSpinner(session);
   }
 
+  // Announce an agent-initiated turn. Without this the work just appears
+  // in the thread under whatever prompt happens to be above it, which
+  // reads as the agent answering something nobody asked, and the
+  // spinner, which is the only other thing that could explain it, is
+  // deleted at finalize. This line stays in the thread.
+  //
+  // It also gives a Slack-side prompt sent during the turn something to
+  // sit behind: hydra holds such a prompt at the head of the queue for
+  // as long as the turn runs.
+  private async postUnsolicitedHeader(
+    session: SessionState,
+    cause: string | undefined,
+  ): Promise<void> {
+    if (!session.threadTs) {
+      return;
+    }
+    await this.opts.thread
+      .postMessage({
+        channel: session.channel,
+        threadTs: session.threadTs,
+        text: formatUnsolicitedHeader(cause),
+      })
+      .catch((err: unknown) => {
+        log.warn(`unsolicited header post failed: ${(err as Error).message}`);
+      });
+  }
+
   // 30-second ticker that re-renders the spinner so its elapsed-time
   // suffix advances on long turns. Provides proof of life — if the
   // suffix keeps advancing the agent is still doing something. Each
@@ -1617,6 +1748,7 @@ export class SessionBridge {
       sourceTsToEntry: new Map(),
       processingTs: undefined,
       currentHeadMessageId: undefined,
+      unsolicitedTurnOpen: false,
       voiceSynthPending: false,
       voiceTurnText: "",
       recentlyAmendedIds: new Set(),
@@ -1936,7 +2068,14 @@ export class SessionBridge {
         // Cancel button stays attached after the edit — without blocks
         // chat.update wipes them (per thread.updateMessage's empty-
         // array fallback) and the indicator silently loses its button.
-        const indicatorText = formatQueuedIndicator(text, ownEntry.initialAheadCount);
+        //
+        // The wire prompt carries no hold state, so carry it across from
+        // the entry; otherwise an amend mid-hold drops the marker.
+        const indicatorText = formatQueuedIndicator(
+          text,
+          ownEntry.initialAheadCount,
+          ownEntry.held === true,
+        );
         const blocks = buildQueuedBlocks(sessionId, ownEntry.promptTs, indicatorText);
         await this.opts.thread
           .updateMessage(
@@ -1955,7 +2094,7 @@ export class SessionBridge {
       // Peer indicators never had an "ahead" suffix in postPeerQueueIndicator,
       // so re-render without one to stay visually consistent. Re-emit
       // blocks so the Cancel button survives the edit.
-      const indicatorText = formatQueuedIndicator(text, 0);
+      const indicatorText = formatQueuedIndicator(text, 0, peer.held === true);
       const blocks = buildQueuedBlocks(sessionId, peer.promptTs, indicatorText);
       await this.opts.thread
         .updateMessage(
@@ -1966,6 +2105,102 @@ export class SessionBridge {
         )
         .catch(() => undefined);
     }
+  }
+
+  // hydra-acp/prompt_queue/held and .../released: a prompt reached the
+  // head of the queue but hydra did not dispatch it, because the agent
+  // is mid-way through a turn it started by itself. The entry stays IN
+  // the queue (so cancel and amend keep working) and the hold has no
+  // upper bound: PROTOCOL.md is explicit that an agent which never
+  // reports the end of its own turn holds the prompt indefinitely.
+  //
+  // So this cannot be left unrendered: without it the user's message
+  // sits in the thread with nothing to show it was received, for an
+  // unbounded time. Worse, `willWait` in sendUserPrompt can be false
+  // when the hold starts (the agent-initiated turn may not have emitted
+  // anything yet, so nothing looked "ahead"), in which case no indicator
+  // was posted at all, and prompt_queue/removed{started} won't post the
+  // Processing one either, since that path is gated on promptTs. Posting
+  // the indicator here closes both gaps.
+  //
+  // `released` does NOT mean the entry started: removed{started} still
+  // follows separately, and a cancelled release means it never ran.
+  private async handlePromptQueueHold(
+    sessionId: string,
+    params: Record<string, unknown>,
+    held: boolean,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const messageId =
+      typeof params.messageId === "string" ? params.messageId : undefined;
+    if (!messageId) return;
+    const reason = typeof params.reason === "string" ? params.reason : undefined;
+    log.info(
+      `prompt_queue/${held ? "held" : "released"} ${sessionId.slice(0, 8)} mid=${messageId.slice(0, 8)}${reason ? ` (${reason})` : ""}`,
+    );
+    const ownEntry = session.queueByMessageId.get(messageId);
+    if (ownEntry) {
+      if (ownEntry.cancelled || ownEntry.started) {
+        return;
+      }
+      ownEntry.held = held;
+      if (!ownEntry.promptTs) {
+        if (!held) {
+          // Released without ever having been rendered: the turn ended
+          // (or the entry went away) fast enough that there's nothing to
+          // update, and removed{started} will post Processing next.
+          return;
+        }
+        const ts = await this.postQueueIndicator(
+          session,
+          ownEntry.text,
+          ownEntry.initialAheadCount,
+          true,
+        );
+        // Re-check: a cancel can land while the post is in flight, and
+        // its handler already rendered the Cancelled state against a
+        // promptTs it didn't have. Drop ours rather than leave a stale
+        // "Queued" line below it.
+        if (ts && (ownEntry.cancelled || ownEntry.started)) {
+          await this.opts.thread
+            .deleteMessage(session.channel, ts)
+            .catch(() => undefined);
+          return;
+        }
+        if (ts) {
+          ownEntry.promptTs = ts;
+        }
+        return;
+      }
+      const indicatorText = formatQueuedIndicator(
+        ownEntry.text,
+        ownEntry.initialAheadCount,
+        held,
+      );
+      const blocks = buildQueuedBlocks(
+        sessionId,
+        ownEntry.promptTs,
+        indicatorText,
+      );
+      await this.opts.thread
+        .updateMessage(
+          session.channel,
+          ownEntry.promptTs,
+          indicatorText,
+          blocks,
+        )
+        .catch(() => undefined);
+      return;
+    }
+    const peer = session.peerQueueByMessageId.get(messageId);
+    if (!peer) return;
+    peer.held = held;
+    const indicatorText = formatQueuedIndicator(peer.text, 0, held);
+    const blocks = buildQueuedBlocks(sessionId, peer.promptTs, indicatorText);
+    await this.opts.thread
+      .updateMessage(session.channel, peer.promptTs, indicatorText, blocks)
+      .catch(() => undefined);
   }
 
   // hydra-acp/prompt_queue/removed: a queued entry left the queue.
@@ -2602,12 +2837,18 @@ export class SessionBridge {
     // spinner is up but we don't have queue knowledge (peer turn
     // started before we attached, or running from a non-queue-aware
     // path).
+    //
+    // unsolicitedTurnOpen is checked alongside the spinner because an
+    // agent-initiated turn is exactly the case where hydra will hold
+    // this prompt, and the turn can be open before it has emitted
+    // anything for the spinner to exist. Without it willWait is false,
+    // no indicator posts, and the held prompt is invisible.
     const ownAhead = session.queuedPrompts.length;
     const peerAhead = session.peerQueueByMessageId.size;
     const aheadCount =
       ownAhead + peerAhead > 0
         ? ownAhead + peerAhead
-        : session.spinnerTs
+        : session.spinnerTs || session.unsolicitedTurnOpen
           ? 1
           : 0;
     // Whether to post a queued indicator at all. If nothing's ahead of
@@ -3240,11 +3481,12 @@ export class SessionBridge {
     session: SessionState,
     text: string,
     aheadCount: number,
+    held = false,
   ): Promise<string | undefined> {
     if (!session.threadTs) {
       return undefined;
     }
-    const indicatorText = formatQueuedIndicator(text, aheadCount);
+    const indicatorText = formatQueuedIndicator(text, aheadCount, held);
     let ts: string | undefined;
     try {
       const r = await this.opts.thread.postMessage({
@@ -3963,6 +4205,40 @@ function agentWithModel(
   return short ? `${agent}·${short}` : agent;
 }
 
+// Unwrap the hydra extension namespace from an update's _meta. Returns
+// undefined for any shape that isn't a plain object at both levels, so
+// callers can read fields off it without re-guarding.
+function readHydraMeta(meta: unknown): Record<string, unknown> | undefined {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return undefined;
+  }
+  const ns = (meta as Record<string, unknown>)["hydra-acp"];
+  if (!ns || typeof ns !== "object" || Array.isArray(ns)) {
+    return undefined;
+  }
+  return ns as Record<string, unknown>;
+}
+
+// Label of the background task hydra believes woke the agent, off
+// turn_started's `cause`. Best-effort on the daemon side (PROTOCOL.md is
+// explicit that it can be absent or stale), so treat a miss as normal.
+// Collapsed to one line and truncated, since it lands inline in a Slack
+// header, and the agent chooses the text.
+function readCauseLabel(cause: unknown): string | undefined {
+  if (!cause || typeof cause !== "object" || Array.isArray(cause)) {
+    return undefined;
+  }
+  const label = (cause as Record<string, unknown>).label;
+  if (typeof label !== "string") {
+    return undefined;
+  }
+  const flat = label.replace(/\s+/g, " ").trim();
+  if (!flat) {
+    return undefined;
+  }
+  return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
+}
+
 // Pull the hydra agentId from an update's _meta extension namespace.
 // session_info_update's ACP-standard payload is just title/updatedAt;
 // /hydra agent carries the new agentId under _meta["hydra-acp"] so
@@ -4091,11 +4367,30 @@ function formatPromptPreview(text: string): string {
 // Em-dash separates the label from the prompt preview; middle-dot
 // separates meta segments. Meta segments stay italic so they don't
 // compete with the preview text for scanning.
-function formatQueuedIndicator(text: string, aheadCount: number): string {
-  const meta = aheadCount > 0
-    ? ` · _${aheadCount === 1 ? "1 ahead" : `${aheadCount} ahead`}_`
-    : "";
+// `held` renders hydra's queue hold: the prompt is at the head but was
+// not dispatched because the agent is mid-way through a turn it started
+// itself. Named explicitly rather than folded into "N ahead" because the
+// hold has no upper bound and nothing in the queue explains it. The
+// user needs to know they're waiting on the agent, not on a line.
+function formatQueuedIndicator(
+  text: string,
+  aheadCount: number,
+  held = false,
+): string {
+  const segs: string[] = [];
+  if (held) {
+    segs.push("held · agent is finishing its own turn");
+  }
+  if (aheadCount > 0) {
+    segs.push(aheadCount === 1 ? "1 ahead" : `${aheadCount} ahead`);
+  }
+  const meta = segs.length > 0 ? ` · _${segs.join(" · ")}_` : "";
   return `:hourglass_flowing_sand: *Queued* — ${formatPromptPreview(text)}${meta}`;
+}
+
+function formatUnsolicitedHeader(cause: string | undefined): string {
+  const why = cause ? ` after \`${cause}\`` : "";
+  return `:zap: _agent resumed on its own${why}_`;
 }
 
 function formatProcessingIndicator(text: string, waitingCount: number): string {
