@@ -3292,9 +3292,11 @@ export class SessionBridge {
 
   // Public entry point for the Block Kit "Amend" button on a queued
   // indicator. Locates the queued entry (own or peer) by its
-  // indicator's Slack ts, fires hydra-acp/prompt/amend with the
-  // current in-flight head as the target, then cancels the queued
-  // entry so it doesn't also run. Returns true when an entry matched.
+  // indicator's Slack ts, tries _session/steering to inject the
+  // replacement into the current in-flight head without cancelling it
+  // (falling back to hydra-acp/prompt/amend's cancel-and-resubmit for
+  // a daemon that predates steering), then cancels the queued entry so
+  // it doesn't also run. Returns true when an entry matched.
   async amendQueuedByPromptTs(
     sessionId: string,
     promptTs: string,
@@ -3350,32 +3352,62 @@ export class SessionBridge {
     for (const img of images) {
       prompt.push({ type: img.type, mimeType: img.mimeType, data: img.data });
     }
-    let amended = false;
+    // Try native mid-turn steering first — it injects into the SAME
+    // running turn (preserving the agent's partial progress) when the
+    // live agent supports it, or hydra itself synthesizes a
+    // cancel-and-resubmit indistinguishable from the legacy amend
+    // path below. Only a live MethodNotFound (a daemon that predates
+    // _session/steering) drops back to the explicit
+    // hydra-acp/prompt/amend call.
+    let landed = false;
     try {
-      const result = await this.opts.attach.request<{
-        amended?: boolean;
+      const steerResult = await this.opts.attach.request<{
+        outcome?: "injected" | "startedNewTurn" | "promptRequired" | "failed";
         reason?: string;
-      }>("hydra-acp/prompt/amend", {
-        sessionId,
-        targetMessageId: headMessageId,
-        prompt,
-      });
-      amended = result?.amended === true;
-      if (!amended) {
+      }>("_session/steering", { sessionId, prompt });
+      landed =
+        steerResult?.outcome === "injected" ||
+        steerResult?.outcome === "startedNewTurn";
+      if (!landed) {
         log.warn(
-          `amend rejected ${sessionId.slice(0, 8)} reason=${result?.reason ?? "?"}`,
+          `steer rejected ${sessionId.slice(0, 8)} outcome=${steerResult?.outcome ?? "?"}`,
         );
+        return false;
       }
     } catch (err) {
-      log.warn(
-        `amend_prompt failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
-      );
+      const code = (err as { code?: number }).code;
+      if (code !== -32601) {
+        log.warn(
+          `steering failed for ${sessionId.slice(0, 8)}: ${(err as Error).message}`,
+        );
+        return false;
+      }
+      try {
+        const result = await this.opts.attach.request<{
+          amended?: boolean;
+          reason?: string;
+        }>("hydra-acp/prompt/amend", {
+          sessionId,
+          targetMessageId: headMessageId,
+          prompt,
+        });
+        landed = result?.amended === true;
+        if (!landed) {
+          log.warn(
+            `amend rejected ${sessionId.slice(0, 8)} reason=${result?.reason ?? "?"}`,
+          );
+        }
+      } catch (amendErr) {
+        log.warn(
+          `amend_prompt failed for ${sessionId.slice(0, 8)}: ${(amendErr as Error).message}`,
+        );
+        return false;
+      }
+    }
+    if (!landed) {
       return false;
     }
-    if (!amended) {
-      return false;
-    }
-    // Amend succeeded — drop the queued entry. cancel_prompt also
+    // Amend/steer landed — drop the queued entry. cancel_prompt also
     // triggers prompt_queue_removed{cancelled} so peers see it leave
     // the queue; we pre-update the indicator here so the visual flips
     // to "amended" rather than "cancelled".
