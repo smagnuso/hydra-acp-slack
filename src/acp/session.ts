@@ -899,7 +899,7 @@ export class SessionBridge {
         session.currentHeadMessageId = undefined;
         break;
       }
-      case "turn_started": {
+      case "_hydra_turn_started": {
         // hydra opened a synthetic turn because the agent restarted
         // itself with no prompt in flight (PROTOCOL.md "Agent-initiated
         // turns"). Only the unsolicited flavour concerns us; anything
@@ -928,7 +928,7 @@ export class SessionBridge {
         await this.postUnsolicitedHeader(session, cause);
         break;
       }
-      case "turn_ended": {
+      case "_hydra_turn_ended": {
         const hydraMeta = readHydraMeta(update._meta);
         if (hydraMeta?.unsolicited !== true) {
           break;
@@ -995,7 +995,7 @@ export class SessionBridge {
         }
         break;
       }
-      case "current_model_update": {
+      case "_hydra_current_model_update": {
         const newModel = update.currentModelId as string | undefined;
         if (newModel && session.modelId !== newModel) {
           session.modelId = newModel;

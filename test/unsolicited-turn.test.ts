@@ -148,7 +148,7 @@ function turnStarted(cause?: string): Record<string, unknown> {
     meta.cause = { toolCallId: "toolu_1", label: cause };
   }
   return {
-    sessionUpdate: "turn_started",
+    sessionUpdate: "_hydra_turn_started",
     messageId: "m_unsol",
     _meta: { "hydra-acp": meta },
   };
@@ -156,7 +156,7 @@ function turnStarted(cause?: string): Record<string, unknown> {
 
 function turnEnded(reason: string): Record<string, unknown> {
   return {
-    sessionUpdate: "turn_ended",
+    sessionUpdate: "_hydra_turn_ended",
     messageId: "m_unsol_end",
     startedMessageId: "m_unsol",
     durationMs: 2100,
