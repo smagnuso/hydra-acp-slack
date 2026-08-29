@@ -35,7 +35,15 @@ export interface AttachOptions {
   // commands) and no conversation history, so the bridge never has to
   // suppress a replay flood. Set to "full" only when the caller actually
   // wants the whole conversation backfilled into the thread.
-  historyPolicy?: "full" | "pending_only" | "none" | "after_message";
+  //
+  // "after_message" is deliberately NOT offered. It needs a replay cursor
+  // (PROTOCOL.md: afterSeq, or the older afterMessageId) and this class
+  // has nowhere to put one — the daemon would find no cutoff and fall
+  // back to "full", quietly dumping an entire conversation into a Slack
+  // thread. There is nothing to resume from anyway: AcpAttach has no
+  // reconnect, a dropped socket tears the bridge down (adopter.ts's
+  // close handler) and discovery re-adopts with a fresh attach.
+  historyPolicy?: "full" | "pending_only" | "none";
 }
 
 export interface AttachEvents {
