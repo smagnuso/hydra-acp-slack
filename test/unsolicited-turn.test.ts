@@ -259,8 +259,17 @@ test("turn_ended with no turn_started we saw does not steal a running turn", asy
   const session = bridge.getSession(SESSION_ID);
   assert.ok(session);
 
-  // A real turn is running (spinner up), and an unbalanced turn_ended
-  // arrives (a daemon restart mid-turn, or history replay).
+  // A real turn is running (spinner up) — a peer's prompt this bridge
+  // instance did observe the start of — and an unbalanced turn_ended
+  // arrives for some OTHER, unsolicited turn (a daemon restart mid-turn,
+  // or history replay). prompt_received is what actually marks a turn
+  // active now (see SessionState.inTurn); bare content no longer does,
+  // since content trailing a call whose own turn already finalized must
+  // not itself resurrect a spinner.
+  update(attach, {
+    sessionUpdate: "prompt_received",
+    prompt: "keep going",
+  });
   update(attach, {
     sessionUpdate: "agent_message_chunk",
     content: { type: "text", text: "working on it" },
@@ -401,5 +410,58 @@ test("a prompt sent during an open unsolicited turn is shown as waiting", async 
 
   attach.promptResponses[0]!.resolve({ stopReason: "end_turn" });
   await p.catch(() => undefined);
+  bridge.cleanup();
+});
+
+test("a tool call outliving its turn does not resurrect a finalized spinner", async () => {
+  const { attach, bridge, thread } = await openBridge();
+  const session = bridge.getSession(SESSION_ID);
+  assert.ok(session);
+
+  // A real turn starts, runs a long-lived exec (a live PTY-backed tool,
+  // e.g. codex-acp launching a foreground app), and ends cleanly while
+  // that exec is still running — matching what a still-armed background
+  // task looks like on the wire (hydra-acp/cli's noteAgentActivity).
+  update(attach, { sessionUpdate: "prompt_received", prompt: "run it" });
+  update(attach, {
+    sessionUpdate: "tool_call",
+    toolCallId: "exec-1",
+    title: "long-running process",
+    kind: "execute",
+    status: "in_progress",
+  });
+  await flush();
+  assert.ok(session.spinnerTs, "spinner should be up while the turn runs");
+
+  update(attach, { sessionUpdate: "turn_complete", stopReason: "end_turn" });
+  await flush();
+  assert.equal(
+    session.spinnerTs,
+    undefined,
+    "turn end finalizes the spinner",
+  );
+  const postsAfterFinalize = thread.posts.length;
+
+  // The exec is still alive and keeps streaming — trailing output for
+  // the SAME toolCallId, arriving after the turn that started it has
+  // already finalized. Before SessionState.inTurn, this reopened a
+  // spinner nothing would ever finalize again.
+  update(attach, {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "exec-1",
+    _meta: { terminal_output_delta: { data: "still going\n" } },
+  });
+  await flush();
+
+  assert.equal(
+    session.spinnerTs,
+    undefined,
+    "trailing tool output must not resurrect a spinner nothing will finalize",
+  );
+  assert.equal(
+    thread.posts.length,
+    postsAfterFinalize,
+    "no new spinner message should have been posted",
+  );
   bridge.cleanup();
 });

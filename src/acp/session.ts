@@ -320,6 +320,19 @@ interface SessionState {
   // replays them, and a daemon restart mid-turn can leave an unbalanced
   // turn_started behind. Mirrors the TUI's `unsolicitedTurnOpen`.
   unsolicitedTurnOpen: boolean;
+  // True from the moment a turn genuinely begins (own prompt fired, a
+  // peer's prompt_received, or an unsolicited turn_started) until
+  // finalizeSpinner runs. Gates spinner *creation*: a tool_call_update or
+  // agent chunk that arrives with this false is trailing output from a
+  // call whose turn already ended, not evidence a new one started, and
+  // must not repost the spinner. A still-armed background exec (a live
+  // PTY-backed tool that outlives the turn that started it) keeps
+  // streaming tool_call_update after a clean turn_complete; without this
+  // flag every one of those reopens a fresh "working..." message that
+  // nothing will ever finalize, since no matching turn boundary is
+  // coming. Updating an *already-posted* spinner (spinnerTs set) is
+  // unaffected — this only blocks minting a new one.
+  inTurn: boolean;
   // When the triggering prompt was transcribed from voice, synthesize the
   // agent's response as audio and upload it to the thread.
   voiceSynthPending: boolean;
@@ -847,6 +860,9 @@ export class SessionBridge {
         // the spinner posted by the agent's first agent_message_chunk
         // would land in Slack before the prompt mirror.
         //
+        // A peer's turn just began — see SessionState.inTurn.
+        session.inTurn = true;
+        //
         // Be defensive about content shape: extract text from anything
         // with a string `text` field, regardless of how the content block
         // tags itself (`type`, `kind`, or no discriminator at all).
@@ -912,6 +928,7 @@ export class SessionBridge {
           break;
         }
         session.unsolicitedTurnOpen = true;
+        session.inTurn = true;
         // No prompt is in flight during an agent-initiated turn, so the
         // last head we recorded belongs to a turn that has already
         // completed. Drop it rather than let the Amend button on a
@@ -1305,7 +1322,14 @@ export class SessionBridge {
         bodyChunks: [],
       };
       session.toolCalls.set(toolCallId, state);
-      session.turnToolCallIds.push(toolCallId);
+      // Only counted toward the *current* turn's spinner when one is
+      // believed active (see SessionState.inTurn) — an id we've never
+      // seen arriving while not in a turn is trailing/replayed content
+      // whose own turn already ended, and must not inflate the next
+      // real turn's tool count.
+      if (session.inTurn) {
+        session.turnToolCallIds.push(toolCallId);
+      }
     }
     if (typeof update.status === "string") {
       state.status = update.status;
@@ -1376,6 +1400,15 @@ export class SessionBridge {
       log.warn(
         `refreshSpinner with no threadTs for ${session.sessionId}; dropping`,
       );
+      return;
+    }
+    // No spinner is up and no turn is believed active: this is trailing
+    // output from a call whose turn already finalized (see
+    // SessionState.inTurn), not evidence of new work. Skip rather than
+    // minting a spinner nothing will ever finalize. An already-posted
+    // spinner (spinnerTs set) still updates regardless — this only
+    // blocks minting a new one.
+    if (!session.spinnerTs && !session.inTurn) {
       return;
     }
     const text = renderSpinner(session);
@@ -1576,6 +1609,7 @@ export class SessionBridge {
     session.spinnerTs = undefined;
     session.spinnerExpanded = false;
     session.turnToolCallIds = [];
+    session.inTurn = false;
     session.spinnerStartedAt = undefined;
     session.planTs = undefined;
     session.exitPlanMessages.clear();
@@ -1749,6 +1783,7 @@ export class SessionBridge {
       processingTs: undefined,
       currentHeadMessageId: undefined,
       unsolicitedTurnOpen: false,
+      inTurn: false,
       voiceSynthPending: false,
       voiceTurnText: "",
       recentlyAmendedIds: new Set(),
@@ -2939,6 +2974,8 @@ export class SessionBridge {
       ? priorBarrier.then(() => ownBarrier)
       : ownBarrier;
     session.pendingOwnTurnEnd = myBarrier;
+    // Our own turn is about to begin — see SessionState.inTurn.
+    session.inTurn = true;
 
     let stopReason: string | undefined;
     try {
