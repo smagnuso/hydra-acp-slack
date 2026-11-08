@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, resolve } from "node:path";
+import { confLockNote } from "./platform-text.js";
 
 export const PRIMARY_CONF_PATH = resolve(homedir(), ".hydra-acp", "slack.conf");
 
@@ -46,9 +47,9 @@ export function readExisting(path: string): { text: string; map: Map<string, str
   return { text, map };
 }
 
-const HEADER = `# hydra-acp-slack config — written by 'hydra-acp-slack setup'.
-# Lock this file: chmod 600.
-`;
+function confHeader(platform: NodeJS.Platform): string {
+  return `# hydra-acp-slack config \u2014 written by 'hydra-acp-slack setup'.\n${confLockNote(platform)}\n`;
+}
 
 const HYDRA_TOKEN_PLACEHOLDER = `# When run standalone, set HYDRA_TOKEN to the token your hydra daemon prints
 # on startup. When run as a hydra extension, hydra injects HYDRA_ACP_TOKEN
@@ -62,7 +63,11 @@ function quoteIfNeeded(value: string): string {
   return value;
 }
 
-export function mergeConf(existing: string, updates: ConfUpdate): string {
+export function mergeConf(
+  existing: string,
+  updates: ConfUpdate,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const lines = parseLines(existing);
   const remaining = new Map<string, string>();
   for (const [k, v] of Object.entries(updates)) {
@@ -83,7 +88,7 @@ export function mergeConf(existing: string, updates: ConfUpdate): string {
 
   if (!existing) {
     out.length = 0;
-    out.push(HEADER.trimEnd());
+    out.push(confHeader(platform).trimEnd());
     out.push("");
   }
 

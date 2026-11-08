@@ -8,6 +8,7 @@ import { ask, askSecret, confirm, maskToken, openBrowser, pause, pickFromList } 
 import { callSlack, callSlackForm, exchangeOAuthCode, grantedScopes, SlackApiError } from "./slack-api.js";
 import { startOAuthServer } from "./oauth-server.js";
 import { confWrittenMessage, PRIMARY_CONF_PATH, readExisting, writeConf } from "./conf-writer.js";
+import { isTransientNpxPath } from "./platform-text.js";
 
 const OAUTH_PORT = 4817;
 
@@ -783,7 +784,7 @@ async function step7RegisterExtension(): Promise<void> {
     const scriptPath = process.argv[1] ?? "";
     if (!scriptPath) {
       warn("Couldn't determine script path; falling back to bare command.");
-    } else if (scriptPath.includes("/.npm/_npx/")) {
+    } else if (isTransientNpxPath(scriptPath)) {
       warn("Looks like you're running via npx — registering this transient path");
       warn("would break on the next npx cache cleanup. Install globally first:");
       info("  npm install -g @hydra-acp/slack");

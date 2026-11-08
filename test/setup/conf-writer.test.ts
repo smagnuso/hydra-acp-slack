@@ -119,3 +119,12 @@ test("confWrittenMessage: win32 does not claim a file mode", () => {
   assert.doesNotMatch(msg, /chmod/);
   assert.match(msg, /Windows file modes are not applied/);
 });
+
+test("mergeConf: the header keeps the chmod advice on POSIX and drops it on win32", () => {
+  const posix = mergeConf("", { SLACK_BOT_TOKEN: "xoxb-abc" }, "linux");
+  assert.match(posix, /^# hydra-acp-slack config \u2014 written by 'hydra-acp-slack setup'\.$/m);
+  assert.match(posix, /^# Lock this file: chmod 600\.$/m);
+  const win = mergeConf("", { SLACK_BOT_TOKEN: "xoxb-abc" }, "win32");
+  assert.doesNotMatch(win, /chmod/);
+  assert.match(win, /Windows file modes are not applied/);
+});
