@@ -124,17 +124,37 @@ export function maskToken(t: string): string {
   return `${t.slice(0, 4)}...`;
 }
 
-export function openBrowser(url: string): void {
-  const p = platform();
-  const cmd = p === "darwin" ? "open" : p === "win32" ? "start" : "xdg-open";
+export interface OpenBrowserDeps {
+  platform?: NodeJS.Platform;
+  spawn?: typeof spawn;
+  write?: (s: string) => void;
+}
+
+export function openBrowser(url: string, deps: OpenBrowserDeps = {}): void {
+  const p = deps.platform ?? platform();
+  const run = deps.spawn ?? spawn;
+  const write = deps.write ?? ((s: string) => process.stdout.write(s));
+  const fallback = (): void => {
+    write(`      Open this URL: ${url}\n`);
+  };
   try {
-    const child = spawn(cmd, [url], { stdio: "ignore", detached: true });
-    child.on("error", () => {
-      process.stdout.write(`      Open this URL: ${url}\n`);
-    });
+    let child;
+    if (p === "win32") {
+      // No shell: `start` is a cmd builtin, and cmd would reinterpret `&` in the URL.
+      child = run("rundll32", ["url.dll,FileProtocolHandler", url], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } else {
+      child = run(p === "darwin" ? "open" : "xdg-open", [url], {
+        stdio: "ignore",
+        detached: true,
+      });
+    }
+    child.on("error", fallback);
     child.unref();
   } catch {
-    process.stdout.write(`      Open this URL: ${url}\n`);
+    fallback();
   }
 }
 
