@@ -1,6 +1,6 @@
 import bolt from "@slack/bolt";
 import { readFile, realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import nodePath, { basename, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { Config } from "../config.js";
 import {
@@ -108,6 +108,25 @@ function containsBinary(buf: Buffer): boolean {
   return false;
 }
 
+// Only `~`, `~/x` and `~\x` mean home; `~foo` is an ordinary relative name.
+export function isHomeRef(input: string): boolean {
+  return input === "~" || input.startsWith("~/") || input.startsWith("~\\");
+}
+
+// True when target is dir itself or lies beneath it. Both must be real paths.
+export function isInsideDir(
+  dir: string,
+  target: string,
+  pathMod: typeof nodePath = nodePath,
+): boolean {
+  const rel = pathMod.relative(dir, target);
+  if (pathMod.isAbsolute(rel)) {
+    return false;
+  }
+  const first = rel.split(/[\\/]/)[0];
+  return first !== "..";
+}
+
 async function resolveCatPath(
   raw: string,
   cwd: string,
@@ -122,9 +141,10 @@ async function resolveCatPath(
   if (input.length === 0) {
     return { ok: false, reason: "usage: !cat <path>" };
   }
-  const wasAbsolute = isAbsolute(input) || input.startsWith("~");
+  const home = isHomeRef(input);
+  const wasAbsolute = isAbsolute(input) || home;
   let expanded = input;
-  if (expanded.startsWith("~")) {
+  if (home) {
     expanded = join(homedir(), expanded.slice(1));
   }
   const joined = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
@@ -140,7 +160,7 @@ async function resolveCatPath(
   } catch {
     cwdReal = cwd;
   }
-  if (!wasAbsolute && !abs.startsWith(cwdReal + "/") && abs !== cwdReal) {
+  if (!wasAbsolute && !isInsideDir(cwdReal, abs)) {
     return { ok: false, reason: "path escapes session cwd" };
   }
   return { ok: true, abs, display: input };
