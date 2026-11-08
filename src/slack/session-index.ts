@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { basename } from "node:path";
 import type { HydraSessionInfo } from "../hydra-discovery.js";
 import { logger } from "../util/log.js";
@@ -29,8 +29,14 @@ interface IndexRow {
   threadTs: string;
 }
 
-function tildify(p: string): string {
-  const home = homedir();
+export function tildify(
+  p: string,
+  deps: { platform?: NodeJS.Platform; home?: string } = {},
+): string {
+  if ((deps.platform ?? platform()) === "win32") {
+    return p;
+  }
+  const home = deps.home ?? homedir();
   if (p === home) {
     return "~";
   }

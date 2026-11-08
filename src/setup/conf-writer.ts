@@ -1,5 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { dirname, resolve } from "node:path";
 
 export const PRIMARY_CONF_PATH = resolve(homedir(), ".hydra-acp", "slack.conf");
@@ -105,6 +105,16 @@ export function mergeConf(existing: string, updates: ConfUpdate): string {
   }
 
   return out.join("\n") + "\n";
+}
+
+export function confWrittenMessage(
+  path: string,
+  p: NodeJS.Platform = platform(),
+): string {
+  if (p === "win32") {
+    return `Wrote ${path} (stored in your user profile; Windows file modes are not applied)`;
+  }
+  return `Wrote ${path} (chmod 600)`;
 }
 
 export function writeConf(path: string, updates: ConfUpdate): void {

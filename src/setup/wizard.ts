@@ -7,7 +7,7 @@ import { resolveSpawnTarget } from "../util/windows-command.js";
 import { ask, askSecret, confirm, maskToken, openBrowser, pause, pickFromList } from "./prompts.js";
 import { callSlack, callSlackForm, exchangeOAuthCode, grantedScopes, SlackApiError } from "./slack-api.js";
 import { startOAuthServer } from "./oauth-server.js";
-import { PRIMARY_CONF_PATH, readExisting, writeConf } from "./conf-writer.js";
+import { confWrittenMessage, PRIMARY_CONF_PATH, readExisting, writeConf } from "./conf-writer.js";
 
 const OAUTH_PORT = 4817;
 
@@ -547,7 +547,7 @@ async function step6WriteConfig(args: {
   }
 
   writeConf(PRIMARY_CONF_PATH, updates);
-  ok(`Wrote ${PRIMARY_CONF_PATH} (chmod 600)`);
+  ok(confWrittenMessage(PRIMARY_CONF_PATH));
   if (updates.AUTHORIZED_USERS)
     ok(`AUTHORIZED_USERS: ${updates.AUTHORIZED_USERS}`);
   if (!map.get("HYDRA_TOKEN") && !process.env.HYDRA_ACP_TOKEN) {

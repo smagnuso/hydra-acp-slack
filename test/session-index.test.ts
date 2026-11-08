@@ -3,7 +3,7 @@ import { beforeEach, test } from "node:test";
 import type { SessionBridge } from "../src/acp/session.js";
 import type { HydraSessionInfo } from "../src/hydra-discovery.js";
 import { setTeamDomain, threadRegistry } from "../src/slack/registry.js";
-import { INDEX_MARKER, SessionIndex } from "../src/slack/session-index.js";
+import { INDEX_MARKER, SessionIndex, tildify } from "../src/slack/session-index.js";
 import type { ThreadClient } from "../src/slack/thread.js";
 
 interface Posted {
@@ -199,4 +199,19 @@ test("renders nothing until the team domain is known", async () => {
   await idx.refreshNow();
 
   assert.equal(thread.posts.length, 0);
+});
+
+test("tildify: POSIX abbreviates home and children", () => {
+  const deps = { platform: "linux" as const, home: "/home/sam" };
+  assert.equal(tildify("/home/sam", deps), "~");
+  assert.equal(tildify("/home/sam/proj", deps), "~/proj");
+  assert.equal(tildify("/home/samuel/proj", deps), "/home/samuel/proj");
+  assert.equal(tildify("/tmp/proj", deps), "/tmp/proj");
+});
+
+test("tildify: win32 never abbreviates, whatever the home", () => {
+  const deps = { platform: "win32" as const, home: "C:\\Users\\sam" };
+  assert.equal(tildify("C:\\Users\\sam\\proj", deps), "C:\\Users\\sam\\proj");
+  assert.equal(tildify("C:\\Users\\sam", deps), "C:\\Users\\sam");
+  assert.equal(tildify("C:/Users/sam/proj", { platform: "win32", home: "C:/Users/sam" }), "C:/Users/sam/proj");
 });

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { mergeConf, readExisting, writeConf } from "../../src/setup/conf-writer.js";
+import { confWrittenMessage, mergeConf, readExisting, writeConf } from "../../src/setup/conf-writer.js";
 
 test("mergeConf: fresh file gets header + updated keys + hydra placeholder", () => {
   const out = mergeConf("", {
@@ -107,4 +107,15 @@ test("writeConf: round-trips preserving comments across multiple writes", () => 
   assert.match(text, /^SLACK_BOT_TOKEN=xoxb-b$/m);
   assert.match(text, /^SLACK_APP_TOKEN=xapp-a$/m);
   assert.match(text, /^HYDRA_TOKEN=secret$/m);
+});
+
+test("confWrittenMessage: POSIX keeps the chmod 600 wording", () => {
+  assert.equal(confWrittenMessage("/h/slack.conf", "linux"), "Wrote /h/slack.conf (chmod 600)");
+  assert.equal(confWrittenMessage("/h/slack.conf", "darwin"), "Wrote /h/slack.conf (chmod 600)");
+});
+
+test("confWrittenMessage: win32 does not claim a file mode", () => {
+  const msg = confWrittenMessage("C:\\h\\slack.conf", "win32");
+  assert.doesNotMatch(msg, /chmod/);
+  assert.match(msg, /Windows file modes are not applied/);
 });
