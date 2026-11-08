@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveSpawnTarget } from "../util/windows-command.js";
 import { ask, askSecret, confirm, maskToken, openBrowser, pause, pickFromList } from "./prompts.js";
 import { callSlack, callSlackForm, exchangeOAuthCode, grantedScopes, SlackApiError } from "./slack-api.js";
 import { startOAuthServer } from "./oauth-server.js";
@@ -79,6 +80,34 @@ function hasBin(name: string): boolean {
     }
   }
   return false;
+}
+
+export type HydraRunResult =
+  | { kind: "ran"; status: number | null }
+  | { kind: "unquotable"; reason: string };
+
+export interface HydraRunDeps {
+  spawnSync?: typeof spawnSync;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+}
+
+export function runHydraAcp(cmdArgs: string[], deps: HydraRunDeps = {}): HydraRunResult {
+  const run = deps.spawnSync ?? spawnSync;
+  let target;
+  try {
+    target = resolveSpawnTarget("hydra-acp", cmdArgs, {
+      platform: deps.platform,
+      env: deps.env,
+    });
+  } catch (err) {
+    return { kind: "unquotable", reason: (err as Error).message };
+  }
+  const result = run(target.command, target.args, {
+    stdio: "inherit",
+    shell: target.shell,
+  });
+  return { kind: "ran", status: result.status };
 }
 
 function defaultBotName(): string {
@@ -766,8 +795,13 @@ async function step7RegisterExtension(): Promise<void> {
   }
 
   info(`Running: hydra-acp ${cmdArgs.join(" ")}`);
-  const result = spawnSync("hydra-acp", cmdArgs, { stdio: "inherit" });
-  if (result.status === 0) {
+  const result = runHydraAcp(cmdArgs);
+  if (result.kind === "unquotable") {
+    blank();
+    warn("Can't pass these arguments through cmd.exe safely.");
+    info("Register manually later with:");
+    info(`  hydra-acp ${cmdArgs.join(" ")}`);
+  } else if (result.status === 0) {
     ok("Registered.");
     info("Start the daemon (or restart if already running): hydra-acp daemon restart");
   } else {
