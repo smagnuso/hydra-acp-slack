@@ -89,7 +89,15 @@ function findStandaloneDoubleDash(s: string): number {
 }
 
 function looksLikePath(s: string): boolean {
-  return s.startsWith("/") || s.startsWith("~") || s.startsWith("./");
+  return (
+    s.startsWith("/") ||
+    s.startsWith("~") ||
+    s.startsWith("./") ||
+    s.startsWith(".\\") ||
+    s.startsWith("..\\") ||
+    s.startsWith("\\\\") ||
+    /^[A-Za-z]:[\\/]/.test(s)
+  );
 }
 
 function looksLikeAgentId(s: string): boolean {

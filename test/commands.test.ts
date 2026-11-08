@@ -204,3 +204,59 @@ test("parseBangCommand: local-bang detection is case-insensitive", () => {
   assert.equal(parseBangCommand("!Session ~/dev"), null);
   assert.equal(parseBangCommand("!AGENTS"), null);
 });
+
+test("Windows backslash drive path is a cwd, rest is the prompt", () => {
+  assert.deepEqual(parseSessionArgs("C:\\proj do the thing"), {
+    agentId: undefined,
+    cwd: "C:\\proj",
+    prompt: "do the thing",
+  });
+});
+
+test("agent followed by forward-slash drive path", () => {
+  assert.deepEqual(parseSessionArgs("claude D:/proj"), {
+    agentId: "claude",
+    cwd: "D:/proj",
+    prompt: undefined,
+  });
+});
+
+test("agent followed by .\\ relative path", () => {
+  assert.deepEqual(parseSessionArgs("claude .\\sub"), {
+    agentId: "claude",
+    cwd: ".\\sub",
+    prompt: undefined,
+  });
+});
+
+test("UNC, ..\\ and ~\\ are cwds", () => {
+  assert.equal(parseSessionArgs("\\\\srv\\share\\p").cwd, "\\\\srv\\share\\p");
+  assert.equal(parseSessionArgs("claude ..\\up").cwd, "..\\up");
+  assert.equal(parseSessionArgs("~\\dev").cwd, "~\\dev");
+});
+
+test("drive path after `--` stays in the prompt", () => {
+  assert.deepEqual(parseSessionArgs("claude -- see C:\\proj"), {
+    agentId: "claude",
+    cwd: undefined,
+    prompt: "see C:\\proj",
+  });
+});
+
+test("ordinary words with colons are not paths", () => {
+  assert.deepEqual(parseSessionArgs("fix: the bug"), {
+    agentId: undefined,
+    cwd: undefined,
+    prompt: "fix: the bug",
+  });
+  assert.equal(parseSessionArgs("a:b do it").cwd, undefined);
+  assert.equal(parseSessionArgs("C: do it").cwd, undefined);
+  assert.equal(parseSessionArgs("C:proj do it").cwd, undefined);
+  assert.equal(parseSessionArgs("1:/x do it").cwd, undefined);
+});
+
+test("POSIX forms are unchanged", () => {
+  assert.equal(parseSessionArgs("/abs/p go").cwd, "/abs/p");
+  assert.equal(parseSessionArgs("claude ./rel").cwd, "./rel");
+  assert.equal(parseSessionArgs("../up go").cwd, undefined);
+});
