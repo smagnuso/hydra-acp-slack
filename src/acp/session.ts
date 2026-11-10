@@ -690,7 +690,9 @@ export class SessionBridge {
               .updateMessage(
                 entry.promptChannel,
                 entry.promptTs,
-                ":question: _Answered elsewhere_",
+                update.action === "cancel"
+                  ? ":question: _Cancelled_"
+                  : ":question: _Answered elsewhere_",
                 [],
               )
               .catch(() => undefined);

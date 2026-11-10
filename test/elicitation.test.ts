@@ -79,3 +79,65 @@ test("parseElicitationState flags missing required and bad numbers", () => {
   });
   assert.equal(bad.ok, false);
 });
+
+const F = "hydra-elic-field";
+
+function one(prop: Record<string, unknown>, value: unknown) {
+  const fields = parseElicitationSchema({
+    type: "object",
+    properties: { k: prop },
+  })!;
+  return parseElicitationState(fields, { "hydra-elic-f0": { [F]: value as Record<string, unknown> } });
+}
+
+test("defaults pre-populate Block Kit elements", () => {
+  const fields = parseElicitationSchema({
+    type: "object",
+    properties: {
+      a: { type: "string", enum: ["p", "q"], default: "q" },
+      b: { type: "array", items: { enum: ["x", "y"] }, default: ["y"] },
+      c: { type: "string", default: "hi" },
+      d: { type: "boolean", default: false },
+      e: { type: "integer", default: 4 },
+    },
+  })!;
+  const els = buildElicitationMessage("s", "e", "m", fields)
+    .blocks.filter((b) => b.type === "input")
+    .map((b) => (b as { element: Record<string, any> }).element);
+  assert.equal(els[0]?.initial_option.value, "1");
+  assert.equal(els[1]?.initial_options[0].value, "1");
+  assert.equal(els[2]?.initial_value, "hi");
+  assert.equal(els[3]?.initial_option.value, "false");
+  assert.equal(els[4]?.initial_value, "4");
+});
+
+test("string constraints are validated", () => {
+  assert.equal(one({ type: "string", minLength: 3 }, { value: "ab" }).ok, false);
+  assert.equal(one({ type: "string", maxLength: 2 }, { value: "abc" }).ok, false);
+  assert.equal(one({ type: "string", pattern: "^a+$" }, { value: "ab" }).ok, false);
+  assert.equal(one({ type: "string", pattern: "^a+$" }, { value: "aa" }).ok, true);
+  assert.equal(one({ type: "string", pattern: "(" }, { value: "z" }).ok, true);
+  assert.equal(one({ type: "string", pattern: "^a$".padEnd(300, "b") }, { value: "z" }).ok, true);
+});
+
+test("string formats are validated", () => {
+  assert.equal(one({ type: "string", format: "email" }, { value: "a@b.co" }).ok, true);
+  assert.equal(one({ type: "string", format: "email" }, { value: "nope" }).ok, false);
+  assert.equal(one({ type: "string", format: "uri" }, { value: "https://x.y" }).ok, true);
+  assert.equal(one({ type: "string", format: "uri" }, { value: "x y" }).ok, false);
+  assert.equal(one({ type: "string", format: "date" }, { value: "2024-02-30" }).ok, false);
+  assert.equal(one({ type: "string", format: "date" }, { value: "2024-02-29" }).ok, true);
+  assert.equal(one({ type: "string", format: "date-time" }, { value: "2024-01-01T10:00:00Z" }).ok, true);
+  assert.equal(one({ type: "string", format: "date-time" }, { value: "2024-01-01" }).ok, false);
+  assert.equal(one({ type: "string", format: "weird" }, { value: "anything" }).ok, true);
+});
+
+test("number and multi-select bounds are validated", () => {
+  assert.equal(one({ type: "number", minimum: 1 }, { value: "0" }).ok, false);
+  assert.equal(one({ type: "number", maximum: 1 }, { value: "2" }).ok, false);
+  assert.equal(one({ type: "number", minimum: 1, maximum: 3 }, { value: "2" }).ok, true);
+  const multi = { type: "array", items: { enum: ["a", "b", "c"] }, minItems: 2, maxItems: 2 };
+  assert.equal(one(multi, { selected_options: [{ value: "0" }] }).ok, false);
+  assert.equal(one(multi, { selected_options: [{ value: "0" }, { value: "1" }, { value: "2" }] }).ok, false);
+  assert.equal(one(multi, { selected_options: [{ value: "0" }, { value: "1" }] }).ok, true);
+});

@@ -51,6 +51,7 @@ export interface ElicitationField {
   hint?: string;
   required: boolean;
   field: Field;
+  prop: Json;
 }
 
 type Json = Record<string, unknown>;
@@ -145,6 +146,7 @@ export function parseElicitationSchema(
       ...(typeof prop.description === "string" ? { hint: prop.description } : {}),
       required: required.has(key),
       field,
+      prop,
     });
   }
   return out;
@@ -159,34 +161,54 @@ function option(c: Choice, index: number): Json {
   return { text: plain(c.title, 75), value: String(index) };
 }
 
-function elementFor(f: Field): Json {
-  switch (f.kind) {
-    case "select":
-      return {
-        type: "static_select",
-        action_id: FIELD_ACTION_ID,
-        placeholder: plain("Select", 150),
-        options: f.choices.map(option),
-      };
-    case "multi":
-      return {
-        type: "multi_static_select",
-        action_id: FIELD_ACTION_ID,
-        placeholder: plain("Select", 150),
-        options: f.choices.map(option),
-      };
-    case "boolean":
-      return {
-        type: "radio_buttons",
-        action_id: FIELD_ACTION_ID,
-        options: [
-          { text: plain("Yes", 75), value: "true" },
-          { text: plain("No", 75), value: "false" },
-        ],
-      };
-    default:
-      return { type: "plain_text_input", action_id: FIELD_ACTION_ID };
+function elementFor(f: ElicitationField): Json {
+  const spec = f.field;
+  const def = f.prop.default;
+  if (spec.kind === "select") {
+    const idx = spec.choices.findIndex((c) => c.value === def);
+    return {
+      type: "static_select",
+      action_id: FIELD_ACTION_ID,
+      placeholder: plain("Select", 150),
+      options: spec.choices.map(option),
+      ...(idx >= 0 ? { initial_option: option(spec.choices[idx]!, idx) } : {}),
+    };
   }
+  if (spec.kind === "multi") {
+    const initial: Json[] = [];
+    if (Array.isArray(def)) {
+      spec.choices.forEach((c, i) => {
+        if (def.includes(c.value)) {
+          initial.push(option(c, i));
+        }
+      });
+    }
+    return {
+      type: "multi_static_select",
+      action_id: FIELD_ACTION_ID,
+      placeholder: plain("Select", 150),
+      options: spec.choices.map(option),
+      ...(initial.length > 0 ? { initial_options: initial } : {}),
+    };
+  }
+  if (spec.kind === "boolean") {
+    const yes = { text: plain("Yes", 75), value: "true" };
+    const no = { text: plain("No", 75), value: "false" };
+    return {
+      type: "radio_buttons",
+      action_id: FIELD_ACTION_ID,
+      options: [yes, no],
+      ...(def === true ? { initial_option: yes } : {}),
+      ...(def === false ? { initial_option: no } : {}),
+    };
+  }
+  const textDefault =
+    typeof def === "string" || typeof def === "number" ? String(def) : undefined;
+  return {
+    type: "plain_text_input",
+    action_id: FIELD_ACTION_ID,
+    ...(textDefault !== undefined ? { initial_value: textDefault } : {}),
+  };
 }
 
 function blockId(index: number): string {
@@ -214,7 +236,7 @@ export function buildElicitationMessage(
       type: "input",
       block_id: blockId(i),
       label: plain(f.label, 2000),
-      element: elementFor(f.field),
+      element: elementFor(f),
       optional: !f.required,
       ...(f.hint ? { hint: plain(f.hint, 2000) } : {}),
     });
@@ -243,6 +265,68 @@ export type ElicitationContent = Record<
 >;
 
 type StateValues = Record<string, Record<string, Json> | undefined>;
+
+const MAX_PATTERN_LEN = 256;
+const MAX_PATTERN_INPUT = 10000;
+
+function checkString(f: ElicitationField, v: string): string | undefined {
+  const p = f.prop;
+  const label = `"${f.label}"`;
+  if (typeof p.minLength === "number" && v.length < p.minLength) {
+    return `${label} must be at least ${p.minLength} characters.`;
+  }
+  if (typeof p.maxLength === "number" && v.length > p.maxLength) {
+    return `${label} must be at most ${p.maxLength} characters.`;
+  }
+  if (
+    typeof p.pattern === "string" &&
+    p.pattern.length <= MAX_PATTERN_LEN &&
+    v.length <= MAX_PATTERN_INPUT
+  ) {
+    let re: RegExp | undefined;
+    try {
+      re = new RegExp(p.pattern);
+    } catch {
+      re = undefined;
+    }
+    if (re && !re.test(v)) {
+      return `${label} does not match the required pattern.`;
+    }
+  }
+  if (typeof p.format === "string" && !formatOk(p.format, v)) {
+    return `${label} must be a valid ${p.format}.`;
+  }
+  return undefined;
+}
+
+function formatOk(format: string, v: string): boolean {
+  switch (format) {
+    case "email":
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+    case "uri":
+      try {
+        new URL(v);
+        return true;
+      } catch {
+        return false;
+      }
+    case "date": {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+      if (!m) {
+        return false;
+      }
+      const d = new Date(`${v}T00:00:00Z`);
+      return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+    }
+    case "date-time":
+      return (
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(v) &&
+        !Number.isNaN(Date.parse(v))
+      );
+    default:
+      return true;
+  }
+}
 
 function optionIndex(o: unknown): number | undefined {
   if (!isObj(o) || typeof o.value !== "string") {
@@ -275,6 +359,15 @@ export function parseElicitationState(
           picked.push(c.value);
         }
       }
+      const label = `"${f.label}"`;
+      if (typeof f.prop.minItems === "number" && picked.length < f.prop.minItems) {
+        if (picked.length > 0 || f.required) {
+          return { ok: false, error: `${label} needs at least ${f.prop.minItems} selections.` };
+        }
+      }
+      if (typeof f.prop.maxItems === "number" && picked.length > f.prop.maxItems) {
+        return { ok: false, error: `${label} allows at most ${f.prop.maxItems} selections.` };
+      }
       if (picked.length > 0) {
         answer = picked;
       }
@@ -296,11 +389,22 @@ export function parseElicitationState(
             error: `"${f.label}" must be ${spec.integer ? "a whole number" : "a number"}.`,
           };
         }
+        const label = `"${f.label}"`;
+        if (typeof f.prop.minimum === "number" && n < f.prop.minimum) {
+          return { ok: false, error: `${label} must be at least ${f.prop.minimum}.` };
+        }
+        if (typeof f.prop.maximum === "number" && n > f.prop.maximum) {
+          return { ok: false, error: `${label} must be at most ${f.prop.maximum}.` };
+        }
         answer = n;
       }
     } else {
       const raw = typeof el?.value === "string" ? el.value : "";
       if (raw.trim() !== "") {
+        const err = checkString(f, raw);
+        if (err) {
+          return { ok: false, error: err };
+        }
         answer = raw;
       }
     }
