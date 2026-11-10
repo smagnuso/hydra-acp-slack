@@ -55,11 +55,21 @@ export interface ContextBlock {
   block_id?: string;
 }
 
+export interface InputBlock {
+  type: "input";
+  label: { type: "plain_text"; text: string };
+  element: Record<string, unknown>;
+  block_id: string;
+  optional?: boolean;
+  hint?: { type: "plain_text"; text: string };
+}
+
 export type SlackBlock =
   | MarkdownBlock
   | SectionBlock
   | ActionsBlock
-  | ContextBlock;
+  | ContextBlock
+  | InputBlock;
 
 const FENCE_INFO_RE = /```([^\s`]+)[ \t]*\n/;
 

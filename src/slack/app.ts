@@ -16,6 +16,11 @@ import {
   SPINNER_DETAILS_ACTION_ID,
 } from "../acp/session.js";
 import { logger } from "../util/log.js";
+import {
+  decodeElicitationValue,
+  ELICITATION_ACTION_PREFIX,
+  ELICITATION_SUBMIT_ACTION_ID,
+} from "./elicitation.js";
 import { languageForPath } from "./cat-lang.js";
 import {
   listAgents,
@@ -793,6 +798,49 @@ export function createSlackApp(
         }
       } catch (err) {
         log.warn(`permission button failed: ${(err as Error).message}`);
+      }
+    },
+  );
+
+  // Submit / Skip on an elicitation form. Field values ride along in
+  // body.state.values, so no modal round trip is needed.
+  app.action(
+    { type: "block_actions", action_id: new RegExp(`^${ELICITATION_ACTION_PREFIX}`) },
+    async ({ ack, body, action, client }) => {
+      await ack();
+      const ba = action as { value?: string; action_id?: string };
+      const b = body as {
+        user?: { id?: string };
+        channel?: { id?: string };
+        state?: { values?: Record<string, Record<string, Record<string, unknown>> | undefined> };
+      };
+      const userId = b.user?.id;
+      if (config.authorizedUsers.size > 0 && (!userId || !config.authorizedUsers.has(userId))) {
+        log.info(`elicitation button drop: unauthorized user ${userId ?? "(none)"}`);
+        return;
+      }
+      const decoded = decodeElicitationValue(ba.value);
+      const entry = decoded ? threadRegistry.findBySession(decoded.s) : undefined;
+      if (!decoded || !entry) {
+        log.info("elicitation button drop: undecodable value or no bridge");
+        return;
+      }
+      try {
+        const err = await entry.bridge.respondToElicitation(
+          decoded.e,
+          ba.action_id === ELICITATION_SUBMIT_ACTION_ID ? "accept" : "decline",
+          b.state?.values,
+          userId,
+        );
+        if (err && b.channel?.id && userId) {
+          await client.chat.postEphemeral({
+            channel: b.channel.id,
+            user: userId,
+            text: err,
+          });
+        }
+      } catch (err) {
+        log.warn(`elicitation button failed: ${(err as Error).message}`);
       }
     },
   );

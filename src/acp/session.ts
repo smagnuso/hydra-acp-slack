@@ -21,6 +21,12 @@ import type { PendingMessage } from "../slack/resurrect.js";
 import { ChannelMap } from "../storage/channels.js";
 import { HiddenStore } from "../storage/hidden.js";
 import { TruncatedStore, fullExpand, truncate } from "../storage/truncated.js";
+import {
+  buildElicitationMessage,
+  parseElicitationSchema,
+  parseElicitationState,
+  type ElicitationField,
+} from "../slack/elicitation.js";
 import { sessionMarker, type ThreadClient } from "../slack/thread.js";
 import { logger } from "../util/log.js";
 import type { AcpAttach } from "./attach.js";
@@ -562,6 +568,18 @@ export class SessionBridge {
       suppressDelete?: boolean;
     }
   >();
+  // elicitationId -> pending ACP form awaiting a Submit or Skip click.
+  elicitations = new Map<
+    string,
+    {
+      requestId: string | number;
+      sessionId: string;
+      fields: ElicitationField[];
+      promptTs: string | undefined;
+      promptChannel: string | undefined;
+      resolved: boolean;
+    }
+  >();
   // Texts of session/prompt requests we sent ourselves, kept around so
   // we can suppress the user_message_chunk that hydra fans back out to
   // all attached frontends (us included). FIFO per session; entries
@@ -660,6 +678,26 @@ export class SessionBridge {
     // if we don't have an entry for the toolCallId, no-op.
     if (n.method === "session/update") {
       const update = (params.update ?? {}) as Record<string, unknown>;
+      if (update.sessionUpdate === "elicitation_resolved") {
+        const id =
+          typeof update.elicitationId === "string" ? update.elicitationId : "";
+        const entry = this.elicitations.get(id);
+        if (entry) {
+          this.elicitations.delete(id);
+          entry.resolved = true;
+          if (entry.promptTs && entry.promptChannel) {
+            await this.opts.thread
+              .updateMessage(
+                entry.promptChannel,
+                entry.promptTs,
+                ":question: _Answered elsewhere_",
+                [],
+              )
+              .catch(() => undefined);
+          }
+        }
+        return;
+      }
       if (update.sessionUpdate === "permission_resolved") {
         const toolCallId =
           typeof update.toolCallId === "string" ? update.toolCallId : undefined;
@@ -780,10 +818,115 @@ export class SessionBridge {
       return;
     }
 
+    if (r.method === "elicitation/create") {
+      await this.handleElicitationRequest(r, sessionId, params);
+      return;
+    }
+
     // hydra-acp broadcasts agent→client requests to every attached
     // client and resolves on the first response. Anything else (fs/*,
     // terminal/*, ...) belongs to a primary frontend — we stay silent
     // so we don't race it with an error.
+  }
+
+  private async handleElicitationRequest(
+    r: JsonRpcRequest,
+    sessionId: string | undefined,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const abstain = (why: string): void => {
+      log.info(`elicitation abstain: ${why}`);
+      this.opts.attach.replyError(r.id, -32601, "elicitation not supported");
+    };
+    const fields =
+      params.mode === "form"
+        ? parseElicitationSchema(params.requestedSchema)
+        : undefined;
+    if (!sessionId || !fields) {
+      abstain("unsupported mode or schema");
+      return;
+    }
+    const meta = (params._meta ?? {}) as Record<string, unknown>;
+    const hydraMeta = (meta["hydra-acp"] ?? {}) as Record<string, unknown>;
+    const id =
+      typeof hydraMeta.elicitationId === "string"
+        ? hydraMeta.elicitationId
+        : `req-${String(r.id)}`;
+    // Registered before any await so elicitation_resolved can find it.
+    const entry = {
+      requestId: r.id,
+      sessionId,
+      fields,
+      promptTs: undefined as string | undefined,
+      promptChannel: undefined as string | undefined,
+      resolved: false,
+    };
+    this.elicitations.set(id, entry);
+    const session = await this.ensureSession(sessionId, params);
+    if (!session) {
+      if (this.elicitations.get(id) === entry) {
+        this.elicitations.delete(id);
+        abstain("no session bridge");
+      }
+      return;
+    }
+    if (entry.resolved) {
+      return;
+    }
+    entry.promptChannel = session.channel;
+    const message = typeof params.message === "string" ? params.message : "";
+    const { text, blocks } = buildElicitationMessage(
+      sessionId,
+      id,
+      message,
+      fields,
+    );
+    const ts = await this.postOrAccumulate(session, text, blocks);
+    if (!entry.resolved) {
+      entry.promptTs = ts;
+    } else if (ts) {
+      await this.opts.thread
+        .deleteMessage(session.channel, ts)
+        .catch(() => undefined);
+    }
+  }
+
+  // Slack Submit / Skip click. Returns an error string to show the user
+  // when the form is invalid (the form stays open), otherwise undefined.
+  async respondToElicitation(
+    elicitationId: string,
+    action: "accept" | "decline",
+    state: Parameters<typeof parseElicitationState>[1],
+    userId: string | undefined,
+  ): Promise<string | undefined> {
+    const entry = this.elicitations.get(elicitationId);
+    if (!entry) {
+      return undefined;
+    }
+    let result: Record<string, unknown> = { action: "decline" };
+    if (action === "accept") {
+      const parsed = parseElicitationState(entry.fields, state);
+      if (!parsed.ok) {
+        return parsed.error;
+      }
+      result = { action: "accept", content: parsed.content };
+    }
+    this.elicitations.delete(elicitationId);
+    entry.resolved = true;
+    this.opts.attach.reply(entry.requestId, result);
+    if (entry.promptTs && entry.promptChannel) {
+      const who = userId ? ` by <@${userId}>` : "";
+      const verb = action === "accept" ? "Answered" : "Skipped";
+      await this.opts.thread
+        .updateMessage(
+          entry.promptChannel,
+          entry.promptTs,
+          `:question: _${verb}${who}_`,
+          [],
+        )
+        .catch(() => undefined);
+    }
+    return undefined;
   }
 
   private async handleSessionUpdate(
