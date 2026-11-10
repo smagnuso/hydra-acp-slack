@@ -141,3 +141,8 @@ test("number and multi-select bounds are validated", () => {
   assert.equal(one(multi, { selected_options: [{ value: "0" }, { value: "1" }, { value: "2" }] }).ok, false);
   assert.equal(one(multi, { selected_options: [{ value: "0" }, { value: "1" }] }).ok, true);
 });
+
+test("attach advertises form elicitation by default", async () => {
+  const { DEFAULT_CLIENT_CAPABILITIES } = await import("../src/acp/attach.js");
+  assert.deepEqual(DEFAULT_CLIENT_CAPABILITIES.elicitation, { form: {} });
+});

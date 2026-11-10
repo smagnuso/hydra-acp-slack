@@ -20,6 +20,13 @@ import {
 
 const log = logger("acp");
 
+// Every attach path goes through the bridge, which can post elicitation forms.
+export const DEFAULT_CLIENT_CAPABILITIES: Record<string, unknown> = {
+  fs: { readTextFile: false, writeTextFile: false },
+  terminal: false,
+  elicitation: { form: {} },
+};
+
 export interface AttachOptions {
   // Hydra-side session id we're attaching to.
   sessionId: string;
@@ -249,10 +256,8 @@ export class AcpAttach extends EventEmitter<AttachEvents> {
         agentInfo?: { name?: string; version?: string };
       }>("initialize", {
         protocolVersion: this.opts.protocolVersion ?? ACP_PROTOCOL_VERSION,
-        clientCapabilities: this.opts.clientCapabilities ?? {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-        },
+        clientCapabilities:
+          this.opts.clientCapabilities ?? DEFAULT_CLIENT_CAPABILITIES,
       });
       if (initResult?.agentInfo && typeof initResult.agentInfo === "object") {
         this._agentInfo = initResult.agentInfo;
